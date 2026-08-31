@@ -1,0 +1,12 @@
+# Rahasia
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Output/artefak runtime
+tiktok_login_success.png
+temp_captcha.png
+cookies.json
+tiktok_storage_state.json

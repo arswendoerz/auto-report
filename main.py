@@ -1,5 +1,8 @@
+"""Entry point: pastikan sesi login siap, lalu jalankan alur report."""
+
 import asyncio
 import os
+import re
 import sys
 
 from playwright.async_api import async_playwright
@@ -9,7 +12,6 @@ if sys.platform == "win32":
 
 from config import (
     STORAGE_STATE_PATH,
-    TARGET_VIDEO_URL,
     HEADLESS,
     BLOCK_HEAVY_RESOURCES,
     BLOCK_IMAGES,
@@ -21,17 +23,13 @@ from perf import Stopwatch, block_heavy_resources
 from tiktok_login import login_tiktok, is_logged_in, logout_tiktok, clear_session_file
 import report
 
-# Flag peluncuran.
-#   - --disable-blink-features=AutomationControlled: sudah ada sejak versi
-#     lama, dipertahankan apa adanya.
-#   - Sisanya murni performa: mematikan throttling timer/render saat jendela
-#     tidak fokus (kalau tidak, Chromium memperlambat halaman di background
-#     dan polling jadi terasa lambat), plus mempercepat startup profil baru.
 LAUNCH_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--disable-dev-shm-usage",
     "--no-first-run",
     "--no-default-browser-check",
+    # Tanpa tiga flag ini Chromium memperlambat halaman saat jendela tidak
+    # fokus, sehingga polling elemen jadi ikut melambat.
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
@@ -44,6 +42,65 @@ MOBILE_FALLBACK = {
     "is_mobile": True,
     "has_touch": True,
 }
+
+
+# Bentuk link video TikTok yang diterima. Link profil (tanpa /video/) dan
+# link non-TikTok ditolak, supaya salah tempel tidak terlanjur diproses.
+TIKTOK_URL_PATTERNS = [
+    re.compile(r"^https?://(www\.|m\.)?tiktok\.com/@[\w.\-]+/video/\d+", re.I),
+    re.compile(r"^https?://(vt|vm)\.tiktok\.com/[\w\-]+", re.I),
+    re.compile(r"^https?://(www\.)?tiktok\.com/t/[\w\-]+", re.I),
+]
+
+
+def _normalize_tiktok_url(raw: str):
+    """Rapikan input mentah jadi URL valid, atau None kalau bukan link video."""
+    url = raw.strip().strip('"\'<>')
+    if not url:
+        return None
+    if not url.lower().startswith(("http://", "https://")):
+        url = "https://" + url
+    for pattern in TIKTOK_URL_PATTERNS:
+        if pattern.match(url):
+            return url
+    return None
+
+
+def ask_target_video_url(max_attempts: int = 3):
+    """Tanyakan link video yang akan dilaporkan. Return None kalau dibatalkan.
+
+    Ditanyakan sebelum browser dijalankan, supaya salah ketik tidak membuang
+    waktu meluncurkan Chromium dan memuat sesi lebih dulu.
+    """
+    print("=" * 62)
+    print("Masukkan link video TikTok yang akan dilaporkan.")
+    print("  contoh : https://www.tiktok.com/@nama/video/1234567890")
+    print("  atau   : https://vt.tiktok.com/XXXXXXX/  (short link, otomatis diikuti)")
+    print("=" * 62)
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            raw = input("Link video: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n[INPUT] Dibatalkan.")
+            return None
+
+        url = _normalize_tiktok_url(raw)
+        if url:
+            print(f"[INPUT] Target: {url}\n")
+            return url
+
+        sisa = max_attempts - attempt
+        if not raw.strip():
+            print("[INPUT] Link tidak boleh kosong.")
+        else:
+            print("[INPUT] Bukan link video TikTok yang valid.")
+            print("[INPUT] Link profil saja (tanpa /video/) tidak bisa dilaporkan.")
+        if sisa:
+            print(f"[INPUT] Sisa percobaan: {sisa}\n")
+
+    print("[INPUT] Terlalu banyak input tidak valid. Dibatalkan.")
+    return None
 
 
 async def _new_context(browser, storage_state=None, device=None):
@@ -61,6 +118,11 @@ async def _new_context(browser, storage_state=None, device=None):
 
 
 async def main():
+    # Ditanyakan lebih dulu: kalau dibatalkan, browser tidak perlu diluncurkan.
+    target_video_url = ask_target_video_url()
+    if not target_video_url:
+        return False
+
     sw = Stopwatch()
     ok = False
 
@@ -68,18 +130,9 @@ async def main():
         browser = await p.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)
         sw.lap("luncurkan browser")
 
-        # PERUBAHAN ALUR (ini penghematan terbesar di run berulang):
-        #
-        # Versi lama SELALU membuat context mobile (emulasi iPhone 12) lebih
-        # dulu, memuat tiktok.com di situ untuk cek sesi, lalu - karena menu
-        # Report cuma ada di layout desktop - membuat context desktop KEDUA
-        # dan menyalin cookies ke sana. Jadi setiap run membayar dua kali
-        # pembuatan context dan dua kali muat halaman, padahal context mobile
-        # itu hanya benar-benar dibutuhkan kalau harus login dari nol.
-        #
-        # Sekarang: langsung buka context desktop dan cek sesi di situ.
-        # Kalau sesi masih valid (kasus paling umum), context mobile tidak
-        # pernah dibuat sama sekali dan alur langsung lanjut ke report.
+        # Context desktop dibuat lebih dulu dan sesi dicek di situ. Kalau sesi
+        # masih valid (kasus paling umum), context mobile tidak pernah dibuat
+        # sama sekali - menu report memang hanya ada di layout desktop.
         has_saved_session = os.path.exists(STORAGE_STATE_PATH)
         context = await _new_context(
             browser, storage_state=STORAGE_STATE_PATH if has_saved_session else None
@@ -93,8 +146,8 @@ async def main():
             print("[LOGIN] Sesi tersimpan masih valid, login dilewati.")
         else:
             print("[LOGIN] Sesi tidak ada/sudah tidak valid, melakukan login penuh...")
-            # Login tetap dijalankan di context mobile, sama seperti versi
-            # lama - selector di tiktok_login.py disusun untuk layout itu.
+            # Login dijalankan di context mobile - selector di tiktok_login.py
+            # disusun untuk layout itu.
             device = p.devices.get("iPhone 12") or MOBILE_FALLBACK
             mobile_context = await _new_context(browser, device=device)
             mobile_page = await mobile_context.new_page()
@@ -104,7 +157,6 @@ async def main():
             print(f"[LOGIN] Sesi disimpan ke {STORAGE_STATE_PATH}")
             await mobile_context.close()
 
-            # Buat ulang context desktop dengan cookies yang baru.
             await context.close()
             context = await _new_context(browser, storage_state=STORAGE_STATE_PATH)
             page = await context.new_page()
@@ -113,17 +165,16 @@ async def main():
         print("\n[MAIN] Menjalankan report...")
         session_stale = False
         try:
-            ok = await report.report_video(page, TARGET_VIDEO_URL)
+            ok = await report.report_video(page, target_video_url)
         except report.StaleSessionError as e:
             session_stale = True
             print(f"[ERROR] {e}")
             print("[ERROR] Menu '...' tidak akan pernah muncul dengan sesi ini.")
         except Exception as e:
             print(f"[ERROR] Gagal menjalankan report: {e}")
-            print("[INFO] Anda bisa menjalankan report.py secara manual setelah login.")
+            print("[INFO] Sesi login tetap tersimpan - jalankan ulang python main.py.")
         finally:
             if session_stale and AUTO_CLEAR_STALE_SESSION:
-                # Hanya di cabang ini sesi dibuang otomatis - bukan tiap run.
                 clear_session_file("sesi ditolak halaman video")
                 print("[INFO] Run berikutnya akan login dari nol.")
                 print("[INFO] Beri jeda dulu kalau TikTok sedang membatasi akun ini.")
@@ -132,17 +183,11 @@ async def main():
                     await logout_tiktok(page)
                 except Exception as e:
                     print(f"[LOGOUT] Gagal: {e}")
-
-                # Sesi sudah tidak berlaku setelah logout. File sesinya
-                # dibuang supaya run berikutnya tidak mencoba memakai
-                # cookies mati dan berakhir di layar "lanjutkan sebagai...".
                 clear_session_file("logout")
             elif session_stale:
                 print("[INFO] AUTO_CLEAR_STALE_SESSION mati - file sesi dibiarkan.")
                 print(f"[INFO] Hapus {STORAGE_STATE_PATH} manual lalu jalankan lagi.")
             else:
-                # Simpan sesi terbaru supaya run berikutnya bisa reuse dan
-                # melewati login sepenuhnya.
                 try:
                     await context.storage_state(path=STORAGE_STATE_PATH)
                 except Exception:

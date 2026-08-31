@@ -1,61 +1,35 @@
+"""Alur report video TikTok: buka video, pilih kategori & alasan, kirim laporan.
+
+Dipanggil oleh main.py. Page yang dikirim harus sudah login dan berlayout desktop.
+"""
+
 import asyncio
-import os
 import re
 import sys
 
-from playwright.async_api import Page, Browser, BrowserContext, async_playwright
+from playwright.async_api import Page
 
-from config import (
-    TARGET_VIDEO_URL,
-    STORAGE_STATE_PATH,
-    FAST_TIMEOUT,
-    SLOW_TIMEOUT,
-    HEADLESS,
-    BLOCK_HEAVY_RESOURCES,
-    BLOCK_IMAGES,
-    PAUSE_AT_END,
-    LOGOUT_AFTER_REPORT,
-    AUTO_CLEAR_STALE_SESSION,
-)
+from config import FAST_TIMEOUT, SLOW_TIMEOUT
 from captcha_solver import check_and_solve_captcha
 from perf import (
     Stopwatch,
-    block_heavy_resources,
     click_first,
     first_match,
     panel_signature,
     wait_panel_change,
 )
+from ui_selectors import APP_POPUP_SELECTORS, CAPTCHA_SELECTOR, LOGIN_BUTTON_SELECTORS
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8')
 
 
-# Selector captcha, disamakan persis dengan yang dipakai captcha_solver.py.
-CAPTCHA_SELECTOR = '.captcha-verify-img-slide, .captcha-verify, div[class*="captcha"]'
-
 MORE_MENU_SELECTOR = 'button[data-e2e="more-menu-icon"]'
 REPORT_ITEM_SELECTOR = '[data-e2e="more-menu-popover_report"]'
+
+# Daftar kategori DAN daftar sub-alasan memakai selector yang sama.
 REASON_LABEL_SELECTOR = 'label[data-e2e="report-card-reason"]'
 
-APP_POPUP_SELECTORS = [
-    '[data-e2e="bottom-cta-cancel-btn"]',
-    "text=/Nanti saja/i",
-    "text=/Not now/i",
-]
-
-# Halaman video menampilkan tombol "Log masuk" = sesi TIDAK dikenali di
-# halaman ini, walaupun cek sesi di homepage sempat lolos. Tanpa deteksi
-# ini script akan terus mencari menu "..." yang memang tidak akan pernah
-# ada, lalu berhenti dengan pesan yang menyesatkan.
-LOGIN_WALL_SELECTORS = [
-    '[data-e2e="top-login-button"]',
-    'button:has-text("Log masuk")',
-    'button:has-text("Log in")',
-]
-
-# Penanda bahwa laporan benar-benar terkirim. Versi lama berhenti dengan
-# "cek manual di browser" tanpa pernah memastikan apa pun.
 REPORT_DONE_SELECTORS = [
     "text=/Terima kasih atas laporan/i",
     "text=/Thanks for (your report|reporting)/i",
@@ -65,38 +39,23 @@ REPORT_DONE_SELECTORS = [
 
 
 class StaleSessionError(RuntimeError):
-    """
-    Halaman video menolak sesi yang dipakai.
+    """Halaman video menolak sesi yang dipakai.
 
-    Dibedakan dari kegagalan biasa karena penanganannya beda: kegagalan
-    lain layak dicoba ulang, sedangkan sesi yang ditolak tidak akan pernah
-    berhasil berapa kali pun diulang - cookies-nya harus dibuang dulu dan
-    login diulang dari nol.
+    Dibedakan dari kegagalan biasa karena penanganannya beda: kegagalan lain
+    layak dicoba ulang, sedangkan sesi yang ditolak tidak akan pernah berhasil
+    berapa kali pun diulang - cookies-nya harus dibuang dan login diulang.
     """
 
 
 async def _maybe_solve_captcha(page: Page) -> bool:
-    """
-    Probe cepat sebelum memanggil penanganan captcha.
-
-    Versi lama selalu membayar `wait_for_selector(timeout=3000)` penuh di
-    jalur normal - padahal di sebagian besar run tidak ada captcha sama
-    sekali, jadi 3 detik itu murni hangus setiap kali. Sekarang dicek
-    dengan probe 600 ms; kalau tidak ada, langsung lanjut.
-
-    Logika penyelesaian captcha-nya sendiri TIDAK diubah - tetap dipanggil
-    apa adanya dari captcha_solver.check_and_solve_captcha().
-    """
+    """Probe cepat dulu; di sebagian besar run tidak ada captcha sama sekali."""
     if await first_match(page, [CAPTCHA_SELECTOR], timeout=600) is None:
         return False
     return await check_and_solve_captcha(page)
 
 
-async def close_tiktok_app_popup(page: Page):
-    """Tutup pop-up 'Tonton video ini di TikTok' dengan mengklik 'Nanti saja'."""
-    # Timeout 5000 -> 1500: pop-up ini kalau muncul, muncul segera. Di
-    # layout desktop biasanya tidak muncul sama sekali, jadi versi lama
-    # membayar 5 detik penuh untuk sesuatu yang tidak ada.
+async def _close_app_popup(page: Page) -> bool:
+    """Tutup pop-up 'Tonton video ini di TikTok'."""
     clicked = await click_first(page, APP_POPUP_SELECTORS, timeout=1500)
     if clicked:
         print("[POPUP] Pop-up 'Tonton sekarang' ditutup (klik Nanti saja).")
@@ -105,44 +64,8 @@ async def close_tiktok_app_popup(page: Page):
     return clicked
 
 
-async def _open_desktop_page(browser: Browser, source_context: BrowserContext):
-    """
-    Buka context + page baru dengan viewport DESKTOP (bukan emulasi mobile).
-
-    Ini diperlukan karena versi mobile web TikTok (yang dipakai untuk login,
-    emulasi iPhone 12) hanya menampilkan halaman "buka di app" yang sangat
-    disederhanakan - tidak ada menu "..." maupun opsi Report sama sekali di
-    situ. Menu Report hanya muncul di layout desktop.
-
-    Cookies dari `source_context` (context tempat login berhasil) dibawa ke
-    context baru ini lewat storage_state, supaya tetap dalam keadaan login
-    tanpa perlu login ulang.
-    """
-    storage = await source_context.storage_state()
-    desktop_context = await browser.new_context(
-        storage_state=storage,
-        viewport={"width": 1280, "height": 800},
-        locale="id-ID",
-        timezone_id="Asia/Jakarta",
-    )
-    if BLOCK_HEAVY_RESOURCES:
-        await block_heavy_resources(desktop_context, block_images=BLOCK_IMAGES)
-    desktop_page = await desktop_context.new_page()
-    return desktop_context, desktop_page
-
-
 async def _goto_with_retry(page: Page, url: str, attempts: int = 3) -> bool:
-    """
-    Buka URL dengan retry berjenjang dan laporan status yang jelas.
-
-    Versi lama memanggil page.goto() sekali tanpa penanganan apa pun.
-    Akibatnya kegagalan sesaat - misalnya TikTok membalas 4xx karena
-    membatasi permintaan - langsung muncul sebagai stack trace mentah
-    `net::ERR_HTTP_RESPONSE_CODE_FAILURE` yang tidak menjelaskan apa pun.
-
-    Catatan: `asyncio.sleep()` di sini adalah jeda backoff yang disengaja
-    antar percobaan, bukan jeda buta menunggu UI.
-    """
+    """Buka URL dengan backoff dan laporan status HTTP yang jelas."""
     delay = 2
     last_error = ""
 
@@ -174,27 +97,17 @@ async def _goto_with_retry(page: Page, url: str, attempts: int = 3) -> bool:
 
 
 async def _prepare_video_page(page: Page) -> bool:
+    """Tunggu menu '...' siap, sambil menangani pop-up dan captcha.
+
+    Raise StaleSessionError kalau halaman menampilkan tembok login.
     """
-    Tunggu sampai halaman video benar-benar siap dipakai, sambil menangani
-    hal-hal yang bisa menghalangi (pop-up app, captcha).
+    # MORE_MENU di indeks 0 supaya ia menang kalau menu sudah siap.
+    selectors = (
+        [MORE_MENU_SELECTOR, CAPTCHA_SELECTOR] + APP_POPUP_SELECTORS + LOGIN_BUTTON_SELECTORS
+    )
+    wall_start = 2 + len(APP_POPUP_SELECTORS)
 
-    Versi lama melakukan ini secara berurutan dengan biaya tetap:
-        sleep(3) + popup wait 5000 + captcha wait 3000  = ~11 detik,
-    dibayar penuh walaupun tidak ada pop-up maupun captcha.
-
-    Sekarang ketiga kemungkinan di-race sekaligus. Kalau yang muncul duluan
-    adalah menu "..." (kasus normal), fungsi ini selesai dalam ratusan
-    milidetik. Kalau yang muncul penghalang, ia ditangani lalu race diulang.
-
-    Return True kalau menu "..." siap diklik.
-    """
-    # Urutan penting: MORE_MENU di indeks 0 supaya ia menang kalau menu
-    # sudah siap, walaupun elemen lain kebetulan juga ada di halaman.
-    selectors = [MORE_MENU_SELECTOR, CAPTCHA_SELECTOR] + APP_POPUP_SELECTORS + LOGIN_WALL_SELECTORS
-    popup_start = 2
-    wall_start = popup_start + len(APP_POPUP_SELECTORS)
-
-    for attempt in range(3):
+    for _ in range(3):
         outcome = await first_match(page, selectors, timeout=SLOW_TIMEOUT)
 
         if outcome is None:
@@ -212,19 +125,13 @@ async def _prepare_video_page(page: Page) -> bool:
                 "dikenali di halaman ini walaupun cek sesi di homepage lolos."
             )
 
-        await close_tiktok_app_popup(page)
+        await _close_app_popup(page)
 
     return await first_match(page, [MORE_MENU_SELECTOR], timeout=FAST_TIMEOUT) is not None
 
 
 async def _pick_reason(page: Page, label: str, pattern, fallback_index: int, previous_signature):
-    """
-    Pilih satu opsi di dialog report: coba cocokkan teks (dwibahasa), lalu
-    fallback ke posisi urutan, lalu fallback manual.
-
-    Perilaku pemilihannya sama persis dengan versi lama. Yang berubah cuma
-    cara menunggunya: `asyncio.sleep(1)` setelah klik diganti deteksi
-    pergantian panel yang sebenarnya (lihat perf.wait_panel_change).
+    """Pilih opsi lewat teks, fallback ke posisi urutan, fallback manual.
 
     Return (berhasil, signature_panel_baru).
     """
@@ -250,27 +157,14 @@ async def _pick_reason(page: Page, label: str, pattern, fallback_index: int, pre
         print(f"[INFO] Pilih '{label}' secara manual di jendela browser.")
         input("Setelah dipilih, tekan Enter untuk lanjut...")
 
-    # Daftar kategori dan daftar sub-alasan memakai selector yang SAMA,
-    # jadi "tunggu selector muncul" akan langsung lolos oleh daftar lama.
-    # Yang dipakai di sini: tunggu isi panelnya benar-benar berganti.
     await wait_panel_change(page, REASON_LABEL_SELECTOR, previous_signature, timeout=FAST_TIMEOUT + 2000)
-    new_signature = await panel_signature(page, REASON_LABEL_SELECTOR)
-    return clicked, new_signature
+    return clicked, await panel_signature(page, REASON_LABEL_SELECTOR)
 
 
 async def report_video(page: Page, video_url: str) -> bool:
-    """
-    Fungsi utama untuk melakukan report video.
-    Diharapkan page sudah dalam keadaan login.
-
-    Return True kalau laporan terkonfirmasi terkirim.
-    """
+    """Report satu video. Return True kalau laporan terkonfirmasi terkirim."""
     sw = Stopwatch()
     print(f"\n[REPORT] Membuka video target: {video_url}")
-    # "networkidle" dihindari: TikTok terus kirim request background
-    # (ads/analytics/preload) yang nyaris tidak pernah benar-benar hening,
-    # jadi wait_until="networkidle" sering timeout 30 detik padahal
-    # halamannya sendiri sudah siap dipakai.
     if not await _goto_with_retry(page, video_url):
         return False
 
@@ -279,21 +173,17 @@ async def report_video(page: Page, video_url: str) -> bool:
         return False
     sw.lap("halaman video siap")
 
-    # Buka menu "..." (titik tiga) pada video.
-    # CATATAN: opsi "Report" TIDAK ada di panel "Bagikan" pada UI TikTok
-    # saat ini - Report hanya bisa diakses lewat menu titik-tiga ini.
+    # Opsi "Report" tidak ada di panel "Bagikan" - hanya lewat menu titik-tiga.
     if not await click_first(page, [MORE_MENU_SELECTOR], timeout=FAST_TIMEOUT):
         print("[ERROR] Gagal membuka menu '...'.")
         return False
     print("[REPORT] Menu '...' diklik.")
 
-    # Pengganti `asyncio.sleep(1)`: tunggu item Report benar-benar dirender.
     if not await click_first(page, [REPORT_ITEM_SELECTOR], timeout=FAST_TIMEOUT):
         print("[ERROR] Gagal menemukan opsi 'Report'.")
         return False
     print("[REPORT] Opsi 'Report' diklik.")
 
-    # Dialog report isinya di-fetch, jadi pakai timeout jaringan.
     if await first_match(page, [REASON_LABEL_SELECTOR], timeout=SLOW_TIMEOUT) is None:
         print("[ERROR] Daftar alasan report tidak muncul.")
         return False
@@ -301,14 +191,9 @@ async def report_video(page: Page, video_url: str) -> bool:
 
     signature = await panel_signature(page, REASON_LABEL_SELECTOR)
 
-    # Pilih kategori "Misinformation" - konten AI/deepfake ada di bawah
-    # kategori ini, bukan sebagai kategori tersendiri di level pertama.
-    #
-    # CATATAN BAHASA: teks kategori bisa muncul dalam Bahasa Indonesia atau
-    # Inggris tergantung akun/sesi. Karena itu dicoba dulu lewat teks
-    # (dwibahasa, best-effort), lalu fallback ke POSISI urutan kategori
-    # (index ke-8 dari atas = "Misinformation" pada urutan kebijakan
-    # standar TikTok, yang biasanya tetap sama walau bahasa UI beda).
+    # Konten AI/deepfake ada di bawah "Misinformation", bukan kategori sendiri.
+    # fallback_index=7: urutan ke-8 pada daftar kebijakan standar TikTok, dipakai
+    # kalau pencocokan teks gagal karena UI muncul dalam bahasa lain.
     _, signature = await _pick_reason(
         page,
         "Kategori Misinformation",
@@ -317,7 +202,6 @@ async def report_video(page: Page, video_url: str) -> bool:
         previous_signature=signature,
     )
 
-    # Sub-alasan spesifik untuk konten AI/deepfake/manipulasi.
     await _pick_reason(
         page,
         "Alasan Deepfakes/synthetic media",
@@ -326,10 +210,8 @@ async def report_video(page: Page, video_url: str) -> bool:
         previous_signature=signature,
     )
 
-    # Beberapa alur report TikTok menampilkan tombol konfirmasi/submit
-    # tambahan setelah alasan dipilih - klik jika ada, tapi jangan
-    # dianggap fatal kalau tidak ditemukan (mungkin sudah otomatis terkirim
-    # begitu alasan terakhir dipilih).
+    # Tombol submit tidak selalu ada - sebagian alur langsung terkirim begitu
+    # alasan terakhir dipilih.
     submitted = await click_first(
         page,
         [
@@ -344,7 +226,6 @@ async def report_video(page: Page, video_url: str) -> bool:
     else:
         print("[INFO] Tidak ada tombol submit tambahan terdeteksi.")
 
-    # Konfirmasi nyata, menggantikan "cek manual di browser" versi lama.
     confirmed = await first_match(page, REPORT_DONE_SELECTORS, timeout=SLOW_TIMEOUT) is not None
     sw.lap("submit + konfirmasi")
 
@@ -358,104 +239,8 @@ async def report_video(page: Page, video_url: str) -> bool:
     return confirmed
 
 
-# ===== FUNGSI YANG DIPANGGIL OLEH main.py =====
-async def main_report(page: Page, browser: Browser, context: BrowserContext):
-    """
-    Kompatibilitas untuk pemanggil lama: menerima context MOBILE hasil
-    login, memindahkan cookies-nya ke context desktop, lalu report.
-
-    main.py versi baru tidak lagi lewat sini - ia langsung membuat context
-    desktop sejak awal supaya tidak perlu membuat dua context saat sesi
-    tersimpan masih valid. Fungsi ini dipertahankan supaya script/pemanggil
-    lain yang sudah ada tidak rusak.
-    """
-    desktop_context, desktop_page = await _open_desktop_page(browser, context)
-
-    # Context mobile (dipakai untuk login) sudah tidak diperlukan lagi
-    # setelah cookies-nya dipindah ke context desktop di atas.
-    try:
-        await context.close()
-    except Exception:
-        pass
-
-    try:
-        return await report_video(desktop_page, TARGET_VIDEO_URL)
-    finally:
-        await desktop_context.close()
-
-
-# ===== STANDALONE (jika report.py dijalankan langsung tanpa main.py) =====
-async def _standalone_main():
-    # Import lokal supaya main.py tidak perlu ikut memuat ulang tiktok_login
-    # setiap kali (menghindari import melingkar report <-> main).
-    from tiktok_login import ensure_logged_in
-
-    async with async_playwright() as p:
-        device = p.devices.get("iPhone 12") or {
-            "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1",
-            "viewport": {"width": 390, "height": 844},
-            "device_scale_factor": 3,
-            "is_mobile": True,
-            "has_touch": True,
-        }
-
-        browser = await p.chromium.launch(
-            headless=HEADLESS,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-
-        has_saved_session = os.path.exists(STORAGE_STATE_PATH)
-        context = await browser.new_context(
-            **device,
-            locale="id-ID",
-            timezone_id="Asia/Jakarta",
-            storage_state=STORAGE_STATE_PATH if has_saved_session else None,
-        )
-        if BLOCK_HEAVY_RESOURCES:
-            await block_heavy_resources(context, block_images=BLOCK_IMAGES)
-        page = await context.new_page()
-
-        print("\n[LOGIN] Memulai proses login (mode standalone)...")
-        await ensure_logged_in(page)
-        await context.storage_state(path=STORAGE_STATE_PATH)
-        print(f"[LOGIN] Sesi disimpan ke {STORAGE_STATE_PATH}")
-
-        print("\n[LOGIN] Login selesai. Melakukan report...")
-        desktop_context, desktop_page = await _open_desktop_page(browser, context)
-
-        try:
-            await context.close()
-        except Exception:
-            pass
-
-        from tiktok_login import logout_tiktok, clear_session_file
-
-        ok = False
-        session_stale = False
-        try:
-            ok = await report_video(desktop_page, TARGET_VIDEO_URL)
-        except StaleSessionError as e:
-            session_stale = True
-            print(f"[ERROR] {e}")
-        except Exception as e:
-            print(f"[ERROR] Gagal menjalankan report: {e}")
-        finally:
-            if session_stale and AUTO_CLEAR_STALE_SESSION:
-                clear_session_file("sesi ditolak halaman video")
-                print("[INFO] Run berikutnya akan login dari nol.")
-            elif LOGOUT_AFTER_REPORT:
-                try:
-                    await logout_tiktok(desktop_page)
-                except Exception as e:
-                    print(f"[LOGOUT] Gagal: {e}")
-                clear_session_file("logout")
-            await desktop_context.close()
-
-        print(f"\n[{'SUCCESS' if ok else 'SELESAI'}] Proses selesai.")
-        if PAUSE_AT_END:
-            input("Tekan Enter untuk menutup browser...")
-        await browser.close()
-
-
 if __name__ == "__main__":
-    asyncio.run(_standalone_main())
+    # report.py sekarang modul, bukan entry point. Pesan ini mencegah
+    # `python report.py` berakhir diam tanpa melakukan apa pun.
+    print("report.py adalah modul, bukan entry point.")
+    print("Jalankan: python main.py")

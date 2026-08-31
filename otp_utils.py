@@ -1,48 +1,4 @@
-"""
-otp_utils.py - Ambil kode OTP TikTok dari inbox Gmail via IMAP.
-
-Sebelumnya logika ini diduplikasi persis di main.py, report.py, dan
-debug_otp.py. Sekarang disatukan di sini supaya perbaikan pola/selector
-cukup dilakukan di satu tempat.
-
-CATATAN PERFORMA & PERBAIKAN (dibanding versi sebelumnya):
-
-1. PERBAIKAN BUG UTAMA - "Kode verifikasi kedaluwarsa atau salah".
-   Versi lama mengambil email TikTok TERBARU YANG ADA saat polling
-   dimulai. Masalahnya, email OTP yang baru butuh beberapa detik untuk
-   sampai, sementara inbox biasanya masih menyimpan email OTP dari
-   permintaan SEBELUMNYA. Jadi yang terbaca adalah kode lama - yang sudah
-   otomatis kedaluwarsa begitu TikTok menerbitkan kode baru.
-   Parameter `last_known_otp` sebenarnya sudah disediakan untuk mencegah
-   ini, tapi pemanggil di tiktok_login.py tidak pernah mengisinya.
-
-   Sekarang dipakai GARIS BATAS berbasis UID: sebelum kode diminta,
-   `latest_tiktok_uid()` mencatat UID email TikTok paling baru. Polling
-   kemudian HANYA menerima email dengan UID lebih besar dari itu, plus
-   pemeriksaan umur email (default maksimal 10 menit).
-
-2. Memakai perintah UID (`uid('search')`/`uid('fetch')`), bukan sequence
-   number seperti versi lama. Sequence number bergeser kalau ada email
-   dihapus/dipindah di tengah proses, sehingga "email ke-N" bisa menunjuk
-   pesan yang berbeda antar polling. UID tidak pernah berubah.
-
-3. Koneksi IMAP di-reuse. Versi lama melakukan IMAP4_SSL() + login() BARU
-   setiap kali polling. Satu handshake TLS + login Gmail memakan ~1-2
-   detik, dikali 6 percobaan = ~10 detik hangus hanya untuk connect ulang.
-
-4. Email ditelusuri dari yang TERBARU dan berhenti di email pertama yang
-   mengandung OTP. Versi lama selalu mengunduh 5 email penuh (RFC822)
-   plus 5 query INTERNALDATE terpisah = 10 round-trip tiap polling.
-
-5. PERBAIKAN BUG: versi lama mengurutkan kandidat dengan
-   `candidates.sort(key=lambda x: x[0])` di mana x[0] adalah string mentah
-   seperti `1 (INTERNALDATE "31-Aug-2026 12:48:00 +0700")`. Itu urutan
-   LEKSIKOGRAFIS, bukan kronologis - "01-Sep" dianggap lebih tua daripada
-   "31-Aug". Sekarang urutan diambil dari UID yang memang kronologis.
-
-6. Interval polling 10 detik -> 3 detik (jumlah percobaan dinaikkan supaya
-   total jendela tunggu tetap ~60 detik).
-"""
+"""Ambil kode OTP TikTok dari inbox Gmail via IMAP."""
 
 import imaplib
 import email
@@ -52,7 +8,7 @@ from email.header import decode_header
 
 from config import EMAIL_IMAP_SERVER, EMAIL_IMAP_PORT, EMAIL_ACCOUNT, EMAIL_PASSWORD
 
-# Urutan pola dicoba dari yang paling spesifik ke paling umum.
+# Dicoba dari yang paling spesifik ke paling umum.
 OTP_PATTERNS = [
     r'kode\s*6\s*digit.*?(\d{6})',
     r'Kode\s*6\s*digit.*?(\d{6})',
@@ -62,9 +18,6 @@ OTP_PATTERNS = [
     r'(\d{6})',
 ]
 
-# Umur maksimal email OTP yang masih mau diterima (detik). Kode TikTok
-# sendiri hanya berlaku beberapa menit, jadi email yang lebih tua dari ini
-# sudah pasti tidak berguna dan lebih baik dilewati daripada diisikan.
 DEFAULT_MAX_AGE_SECONDS = 600
 
 
@@ -110,13 +63,7 @@ def _extract_otp_from_message(raw_email: bytes):
 
 
 class ImapSession:
-    """
-    Koneksi IMAP yang bisa dipakai berulang kali.
-
-    `select("inbox")` dipanggil ulang tiap kali dipakai supaya email yang
-    baru masuk setelah koneksi terbuka tetap terlihat oleh SEARCH.
-    Kalau koneksi mati di tengah jalan, ia menyambung ulang sendiri.
-    """
+    """Koneksi IMAP yang dipakai ulang antar polling, menyambung ulang bila putus."""
 
     def __init__(self):
         self._mail = None
@@ -158,7 +105,8 @@ class ImapSession:
 
 
 def _uid_search(mail):
-    """Cari UID semua email dari TikTok. UID stabil, tidak bergeser."""
+    """UID semua email dari TikTok. UID dipakai (bukan sequence number) karena
+    tidak bergeser saat ada email lain dihapus di tengah polling."""
     status, data = mail.uid("search", None, '(FROM "tiktok")')
     if status != "OK" or not data or not data[0]:
         return []
@@ -166,7 +114,7 @@ def _uid_search(mail):
 
 
 def _message_age_seconds(mail, uid):
-    """Umur email dalam detik, atau (None, "") kalau gagal dibaca."""
+    """Return (umur_detik_atau_None, date_str)."""
     try:
         status, data = mail.uid("fetch", str(uid), "(INTERNALDATE)")
         if status != "OK" or not data or not data[0]:
@@ -182,13 +130,9 @@ def _message_age_seconds(mail, uid):
 
 
 def latest_tiktok_uid(session: ImapSession = None) -> int:
-    """
-    UID email TikTok terbaru SAAT INI. Dipakai sebagai garis batas: dicatat
-    tepat sebelum kode OTP diminta, supaya email OTP lama tidak ikut
-    terbaca oleh polling.
+    """UID email TikTok terbaru saat ini, atau 0 kalau gagal.
 
-    Return 0 kalau inbox kosong atau IMAP gagal diakses. Nilai 0 berarti
-    "tidak ada garis batas", dan polling akan memberi peringatan.
+    Dipakai sebagai garis batas: dicatat SEBELUM kode diminta ke TikTok.
     """
 
     def _run(active):
@@ -208,8 +152,8 @@ def latest_tiktok_uid(session: ImapSession = None) -> int:
 
 
 def _fetch_with_session(session, max_lookback, after_uid=0, max_age_seconds=None):
-    """
-    Cari email OTP terbaru yang UID-nya di atas `after_uid`.
+    """Email OTP terbaru dengan UID di atas `after_uid`.
+
     Return dict {otp, uid, subject, date, age} atau None.
     """
     mail = session.mail()
@@ -219,11 +163,10 @@ def _fetch_with_session(session, max_lookback, after_uid=0, max_age_seconds=None
     if not uids:
         return None
 
-    # UID naik seiring waktu, jadi urutan terbalik = terbaru duluan.
     for uid in sorted(uids, reverse=True)[:max_lookback]:
         if after_uid and uid <= after_uid:
-            # Sudah sampai ke email yang sudah ada SEBELUM kode diminta.
-            # Semua sisanya lebih tua lagi, jadi tidak perlu dilanjutkan.
+            # Sudah sampai ke email yang ada sebelum kode diminta; sisanya
+            # pasti lebih tua lagi.
             break
 
         status, msg_data = mail.uid("fetch", str(uid), "(RFC822)")
@@ -244,42 +187,16 @@ def _fetch_with_session(session, max_lookback, after_uid=0, max_age_seconds=None
     return None
 
 
-def fetch_latest_otp(max_lookback: int = 5, session: ImapSession = None, after_uid: int = 0,
-                     max_age_seconds: int = None):
-    """
-    Ambil satu kali snapshot OTP terbaru dari email TikTok di inbox.
-    Return (otp, date_str) atau (None, None) jika tidak ditemukan.
-
-    `session` opsional: kalau diberikan, koneksi itu dipakai ulang (dipakai
-    oleh wait_for_new_otp). Kalau tidak, koneksi sekali pakai dibuat dan
-    ditutup lagi.
-
-    `after_uid` opsional: hanya terima email yang lebih baru dari UID ini.
-    """
-    if session is not None:
-        result = _fetch_with_session(session, max_lookback, after_uid, max_age_seconds)
-    else:
-        with ImapSession() as own_session:
-            result = _fetch_with_session(own_session, max_lookback, after_uid, max_age_seconds)
-
-    if not result:
-        return None, None
-    return result["otp"], result["date"]
-
-
 def wait_for_new_otp(last_known_otp=None, max_attempts: int = 20, wait_seconds: int = 3,
                      after_uid: int = 0, max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS):
-    """
-    Polling inbox sampai menemukan OTP dari email yang benar-benar BARU.
+    """Polling inbox sampai ada OTP dari email yang benar-benar baru.
 
-    `after_uid` adalah garis batasnya - ambil dari latest_tiktok_uid() yang
-    dipanggil SEBELUM kode diminta ke TikTok. Tanpa ini, fungsi akan
-    menerima OTP dari permintaan sebelumnya dan TikTok akan menolaknya
-    dengan "Kode verifikasi kedaluwarsa atau salah".
+    `after_uid` WAJIB diisi dari latest_tiktok_uid() yang dipanggil sebelum kode
+    diminta. Tanpa itu, email OTP dari permintaan sebelumnya ikut terbaca dan
+    TikTok menolaknya dengan "Kode verifikasi kedaluwarsa atau salah".
 
-    CATATAN: fungsi ini SINKRON dan memakai time.sleep(). Jangan panggil
-    langsung dari coroutine - pakai `await asyncio.to_thread(...)` seperti
-    di tiktok_login.py, supaya event loop tidak ikut membeku.
+    Fungsi ini sinkron dan memakai time.sleep() - panggil lewat
+    `asyncio.to_thread(...)` supaya event loop tidak ikut membeku.
     """
     if after_uid:
         print(f"[OTP] Menunggu email OTP baru (setelah UID {after_uid})...")

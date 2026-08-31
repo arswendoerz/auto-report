@@ -1,0 +1,17 @@
+# AKUN 1
+TIKTOK_EMAIL=edoytmsc@gmail.com
+TIKTOK_PASSWORD=4bogoboga!
+EMAIL_ACCOUNT=edoytmsc@gmail.com
+EMAIL_APP_PASSWORD=xbsyyvkddxpseuwx
+
+# AKUN 2
+TIKTOK_EMAIL=arswendoerza00@gmail.com
+TIKTOK_PASSWORD=11akusayangibu!
+EMAIL_ACCOUNT=arswendoerza00@gmail.com
+EMAIL_APP_PASSWORD=dtfcpwfxrahdlpco
+
+# AKUN 3
+TIKTOK_EMAIL=e07091011@gmail.com
+TIKTOK_PASSWORD=4bogoboga!
+EMAIL_ACCOUNT=e07091011@gmail.com
+EMAIL_APP_PASSWORD=eqlqvwugeuactgaq

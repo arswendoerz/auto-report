@@ -6,13 +6,10 @@ import re
 
 from playwright.async_api import Page
 
-from config import (
-    TIKTOK_EMAIL,
-    TIKTOK_PASSWORD,
-    FAST_TIMEOUT,
-    SLOW_TIMEOUT,
-    STORAGE_STATE_PATH,
-)
+import config
+# Kredensial dibaca lewat `config.NAMA` supaya override dari gui.py
+# (config.apply_credentials) ikut terbaca. Sisanya nilai statis.
+from config import FAST_TIMEOUT, SLOW_TIMEOUT, STORAGE_STATE_PATH
 from otp_utils import wait_for_new_otp, latest_tiktok_uid
 from perf import click_first, first_match
 from ui_selectors import APP_POPUP_SELECTORS, CAPTCHA_SELECTOR, LOGIN_BUTTON_SELECTORS
@@ -135,8 +132,8 @@ async def _fill_credentials(page: Page) -> bool:
     try:
         email_input = page.locator('input[name="username"], input[type="text"], input[type="email"]').first
         await email_input.wait_for(state="visible", timeout=SLOW_TIMEOUT)
-        await email_input.fill(TIKTOK_EMAIL)
-        print(f"[LOGIN] Email terisi: {TIKTOK_EMAIL}")
+        await email_input.fill(config.TIKTOK_EMAIL)
+        print(f"[LOGIN] Email terisi: {config.TIKTOK_EMAIL}")
     except Exception as e:
         print(f"[ERROR] Gagal isi email: {e}")
         return False
@@ -144,7 +141,7 @@ async def _fill_credentials(page: Page) -> bool:
     try:
         pass_input = page.locator('input[type="password"]').first
         await pass_input.wait_for(state="visible", timeout=SLOW_TIMEOUT)
-        await pass_input.fill(TIKTOK_PASSWORD)
+        await pass_input.fill(config.TIKTOK_PASSWORD)
         print("[LOGIN] Password terisi.")
     except Exception as e:
         print(f"[ERROR] Gagal isi password: {e}")

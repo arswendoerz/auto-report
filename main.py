@@ -1,4 +1,7 @@
-"""Entry point: pastikan sesi login siap, lalu jalankan alur report."""
+"""Entry point CLI: pastikan sesi login siap, lalu jalankan alur report.
+
+Orkestrasinya ada di run_report() supaya bisa dipakai ulang oleh gui.py.
+"""
 
 import asyncio
 import os
@@ -10,6 +13,7 @@ from playwright.async_api import async_playwright
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8')
 
+import config
 from config import (
     STORAGE_STATE_PATH,
     HEADLESS,
@@ -52,12 +56,25 @@ TIKTOK_URL_PATTERNS = [
     re.compile(r"^https?://(www\.)?tiktok\.com/t/[\w\-]+", re.I),
 ]
 
+# Kode video saja: angka panjang yang ada di belakang /video/.
+VIDEO_ID_PATTERN = re.compile(r"^\d{8,25}$")
 
-def _normalize_tiktok_url(raw: str):
-    """Rapikan input mentah jadi URL valid, atau None kalau bukan link video."""
+
+def normalize_tiktok_url(raw: str):
+    """Rapikan input mentah jadi URL valid, atau None kalau bukan link video.
+
+    Menerima link penuh, short link, atau kode video saja.
+    """
     url = raw.strip().strip('"\'<>')
     if not url:
         return None
+
+    if VIDEO_ID_PATTERN.match(url):
+        # Hanya kode video yang ditempel. Tanpa username, URL kanonik tidak
+        # bisa disusun langsung, jadi dipakai endpoint redirect lama
+        # m.tiktok.com/v/<id>.html supaya TikTok sendiri yang mengarahkan.
+        return f"https://m.tiktok.com/v/{url}.html"
+
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url
     for pattern in TIKTOK_URL_PATTERNS:
@@ -73,9 +90,10 @@ def ask_target_video_url(max_attempts: int = 3):
     waktu meluncurkan Chromium dan memuat sesi lebih dulu.
     """
     print("=" * 62)
-    print("Masukkan link video TikTok yang akan dilaporkan.")
+    print("Masukkan link atau kode video TikTok yang akan dilaporkan.")
     print("  contoh : https://www.tiktok.com/@nama/video/1234567890")
     print("  atau   : https://vt.tiktok.com/XXXXXXX/  (short link, otomatis diikuti)")
+    print("  atau   : 1234567890123456789  (kode video saja)")
     print("=" * 62)
 
     for attempt in range(1, max_attempts + 1):
@@ -85,7 +103,7 @@ def ask_target_video_url(max_attempts: int = 3):
             print("\n[INPUT] Dibatalkan.")
             return None
 
-        url = _normalize_tiktok_url(raw)
+        url = normalize_tiktok_url(raw)
         if url:
             print(f"[INPUT] Target: {url}\n")
             return url
@@ -94,7 +112,7 @@ def ask_target_video_url(max_attempts: int = 3):
         if not raw.strip():
             print("[INPUT] Link tidak boleh kosong.")
         else:
-            print("[INPUT] Bukan link video TikTok yang valid.")
+            print("[INPUT] Bukan link/kode video TikTok yang valid.")
             print("[INPUT] Link profil saja (tanpa /video/) tidak bisa dilaporkan.")
         if sisa:
             print(f"[INPUT] Sisa percobaan: {sisa}\n")
@@ -117,49 +135,85 @@ async def _new_context(browser, storage_state=None, device=None):
     return context
 
 
-async def main():
-    # Ditanyakan lebih dulu: kalau dibatalkan, browser tidak perlu diluncurkan.
-    target_video_url = ask_target_video_url()
-    if not target_video_url:
-        return False
+async def _announce_page(on_page, page):
+    """Beri tahu pemanggil bahwa ada page (jendela browser) baru.
+
+    Dipakai gui.py untuk menempelkan jendela Chromium ke panel kanan. Kegagalan
+    di sini tidak boleh ikut menggagalkan alur report.
+    """
+    if on_page is None:
+        return
+    try:
+        await on_page(page)
+    except Exception as e:
+        print(f"[GUI] Gagal menempelkan jendela browser: {e}")
+
+
+async def run_report(target_video_url: str, headless: bool = None, on_page=None) -> bool:
+    """Satu siklus penuh: luncurkan browser, pastikan login, lalu report.
+
+    `target_video_url` harus sudah lewat normalize_tiktok_url().
+    `on_page` (async, opsional) dipanggil setiap kali page baru dibuat.
+    """
+    if headless is None:
+        headless = HEADLESS
 
     sw = Stopwatch()
     ok = False
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)
+        browser = await p.chromium.launch(headless=headless, args=LAUNCH_ARGS)
         sw.lap("luncurkan browser")
 
-        # Context desktop dibuat lebih dulu dan sesi dicek di situ. Kalau sesi
-        # masih valid (kasus paling umum), context mobile tidak pernah dibuat
-        # sama sekali - menu report memang hanya ada di layout desktop.
+        # SATU CONTEXT HIDUP PADA SATU WAKTU. Tiap context punya jendela OS
+        # sendiri, jadi context desktop dan mobile yang hidup bersamaan berarti
+        # dua jendela browser terbuka bersamaan - dan hanya satu yang bisa
+        # ditempelkan ke panel gui.py. Urutannya sekarang:
+        #   sesi ada    -> context desktop saja, langsung report (kasus umum)
+        #   sesi kosong -> context mobile (login), TUTUP, baru context desktop
         has_saved_session = os.path.exists(STORAGE_STATE_PATH)
-        context = await _new_context(
-            browser, storage_state=STORAGE_STATE_PATH if has_saved_session else None
-        )
-        page = await context.new_page()
+        context = None
+        page = None
+        logged_in = False
 
-        logged_in = await is_logged_in(page) if has_saved_session else False
-        sw.lap("cek sesi tersimpan")
+        if has_saved_session:
+            context = await _new_context(browser, storage_state=STORAGE_STATE_PATH)
+            page = await context.new_page()
+            await _announce_page(on_page, page)
+            logged_in = await is_logged_in(page)
+            sw.lap("cek sesi tersimpan")
+        else:
+            print("[LOGIN] Belum ada file sesi tersimpan.")
 
         if logged_in:
             print("[LOGIN] Sesi tersimpan masih valid, login dilewati.")
         else:
             print("[LOGIN] Sesi tidak ada/sudah tidak valid, melakukan login penuh...")
+            # Jendela desktop ditutup DULU, bukan setelah login: kalau dibiarkan
+            # hidup, jendela login mobile muncul sebagai jendela kedua yang
+            # mengapung di luar panel.
+            if context is not None:
+                await context.close()
+                context = page = None
+
             # Login dijalankan di context mobile - selector di tiktok_login.py
             # disusun untuk layout itu.
             device = p.devices.get("iPhone 12") or MOBILE_FALLBACK
             mobile_context = await _new_context(browser, device=device)
             mobile_page = await mobile_context.new_page()
+            await _announce_page(on_page, mobile_page)
 
             await login_tiktok(mobile_page)
             await mobile_context.storage_state(path=STORAGE_STATE_PATH)
             print(f"[LOGIN] Sesi disimpan ke {STORAGE_STATE_PATH}")
             await mobile_context.close()
 
-            await context.close()
+            # Report WAJIB di layout desktop: menu titik-tiga yang memuat opsi
+            # "Report" tidak dirender di layout mobile, jadi alurnya tidak bisa
+            # diselesaikan seluruhnya dengan device HP.
             context = await _new_context(browser, storage_state=STORAGE_STATE_PATH)
             page = await context.new_page()
+            await _announce_page(on_page, page)
             sw.lap("login penuh")
 
         print("\n[MAIN] Menjalankan report...")
@@ -169,10 +223,13 @@ async def main():
         except report.StaleSessionError as e:
             session_stale = True
             print(f"[ERROR] {e}")
-            print("[ERROR] Menu '...' tidak akan pernah muncul dengan sesi ini.")
+            print("[ERROR] Menu titik-tiga tidak akan pernah muncul dengan sesi ini.")
+        except asyncio.CancelledError:
+            print("[MAIN] Dihentikan oleh pengguna.")
+            raise
         except Exception as e:
             print(f"[ERROR] Gagal menjalankan report: {e}")
-            print("[INFO] Sesi login tetap tersimpan - jalankan ulang python main.py.")
+            print("[INFO] Sesi login tetap tersimpan - jalankan ulang saja.")
         finally:
             if session_stale and AUTO_CLEAR_STALE_SESSION:
                 clear_session_file("sesi ditolak halaman video")
@@ -199,6 +256,17 @@ async def main():
             await browser.close()
 
     return ok
+
+
+async def main():
+    config.require_credentials()
+
+    # Ditanyakan lebih dulu: kalau dibatalkan, browser tidak perlu diluncurkan.
+    target_video_url = ask_target_video_url()
+    if not target_video_url:
+        return False
+
+    return await run_report(target_video_url)
 
 
 if __name__ == "__main__":

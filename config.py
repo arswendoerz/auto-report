@@ -1,4 +1,9 @@
-"""Konfigurasi terpusat. Nilai sensitif diambil dari .env, bukan dari source code."""
+"""Konfigurasi terpusat.
+
+Nilai sensitif diambil dari .env, bukan dari source code. Kredensial TIDAK lagi
+memaksa keluar saat import: gui.py mengisinya dari form lewat
+apply_credentials(), jadi validasi dipindah ke pemanggil (require_credentials()).
+"""
 
 import os
 import sys
@@ -6,15 +11,6 @@ import sys
 from dotenv import load_dotenv
 
 load_dotenv()
-
-
-def _require(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        print(f"[CONFIG] ERROR: Variabel '{name}' belum diisi di file .env")
-        print("[CONFIG] Salin .env.example menjadi .env lalu isi nilainya.")
-        sys.exit(1)
-    return value
 
 
 def _flag(name: str, default: bool) -> bool:
@@ -25,19 +21,77 @@ def _flag(name: str, default: bool) -> bool:
 
 
 # ===== AKUN TIKTOK =====
-TIKTOK_EMAIL = _require("TIKTOK_EMAIL")
-TIKTOK_PASSWORD = _require("TIKTOK_PASSWORD")
+TIKTOK_EMAIL = os.getenv("TIKTOK_EMAIL", "").strip()
+TIKTOK_PASSWORD = os.getenv("TIKTOK_PASSWORD", "")
 
 # ===== EMAIL (untuk ambil OTP via IMAP) =====
 EMAIL_IMAP_SERVER = os.getenv("EMAIL_IMAP_SERVER", "imap.gmail.com")
 EMAIL_IMAP_PORT = int(os.getenv("EMAIL_IMAP_PORT", "993"))
-EMAIL_ACCOUNT = _require("EMAIL_ACCOUNT")
-EMAIL_PASSWORD = _require("EMAIL_APP_PASSWORD")
+EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT", "").strip()
+EMAIL_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "")
+
+# Label untuk pesan error. Kunci = nama variabel di modul ini, nilai = nama
+# variabel .env yang setara (dipakai juga saat gui.py menyimpan ke .env).
+CREDENTIAL_ENV_NAMES = {
+    "TIKTOK_EMAIL": "TIKTOK_EMAIL",
+    "TIKTOK_PASSWORD": "TIKTOK_PASSWORD",
+    "EMAIL_ACCOUNT": "EMAIL_ACCOUNT",
+    "EMAIL_PASSWORD": "EMAIL_APP_PASSWORD",
+}
+
+
+def apply_credentials(
+    tiktok_email: str = None,
+    tiktok_password: str = None,
+    email_account: str = None,
+    email_app_password: str = None,
+):
+    """Override kredensial saat runtime (dipakai gui.py).
+
+    Modul lain WAJIB membacanya lewat `config.NAMA` - bukan `from config import
+    NAMA` - supaya nilai baru di sini ikut terbaca. `from ... import` mengikat
+    nilainya sekali saat import dan tidak pernah ikut berubah.
+    """
+    global TIKTOK_EMAIL, TIKTOK_PASSWORD, EMAIL_ACCOUNT, EMAIL_PASSWORD
+
+    if tiktok_email is not None:
+        TIKTOK_EMAIL = tiktok_email.strip()
+    if tiktok_password is not None:
+        TIKTOK_PASSWORD = tiktok_password
+    if email_account is not None:
+        EMAIL_ACCOUNT = email_account.strip()
+    if email_app_password is not None:
+        EMAIL_PASSWORD = email_app_password
+
+
+def missing_credentials() -> list:
+    """Nama variabel .env yang masih kosong."""
+    values = {
+        "TIKTOK_EMAIL": TIKTOK_EMAIL,
+        "TIKTOK_PASSWORD": TIKTOK_PASSWORD,
+        "EMAIL_ACCOUNT": EMAIL_ACCOUNT,
+        "EMAIL_PASSWORD": EMAIL_PASSWORD,
+    }
+    return [CREDENTIAL_ENV_NAMES[key] for key, value in values.items() if not value]
+
+
+def require_credentials():
+    """Keluar dengan pesan jelas kalau kredensial belum lengkap (dipakai CLI)."""
+    missing = missing_credentials()
+    if not missing:
+        return
+    for name in missing:
+        print(f"[CONFIG] ERROR: Variabel '{name}' belum diisi di file .env")
+    print("[CONFIG] Salin .env.example menjadi .env lalu isi nilainya,")
+    print("[CONFIG] atau jalankan 'python gui.py' dan isi lewat form.")
+    sys.exit(1)
+
 
 # ===== TARGET REPORT =====
 # Sengaja TIDAK ada di sini. Link video ditanyakan langsung saat script
-# dijalankan (lihat ask_target_video_url() di main.py), supaya target selalu
-# ditentukan sadar tiap run - tidak pernah terwarisi diam-diam dari file.
+# dijalankan (lihat ask_target_video_url() di main.py) atau diisi di form
+# gui.py, supaya target selalu ditentukan sadar tiap run - tidak pernah
+# terwarisi diam-diam dari file.
 
 # ===== SESI BROWSER =====
 # Cookies login yang disimpan setelah login berhasil. Selama file ini valid,

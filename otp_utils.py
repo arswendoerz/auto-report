@@ -6,7 +6,9 @@ import re
 import time
 from email.header import decode_header
 
-from config import EMAIL_IMAP_SERVER, EMAIL_IMAP_PORT, EMAIL_ACCOUNT, EMAIL_PASSWORD
+import config
+# Dibaca lewat `config.NAMA` supaya kredensial yang diisi dari form gui.py
+# (config.apply_credentials) ikut terbaca di sini.
 
 # Dicoba dari yang paling spesifik ke paling umum.
 OTP_PATTERNS = [
@@ -69,8 +71,8 @@ class ImapSession:
         self._mail = None
 
     def _connect(self):
-        mail = imaplib.IMAP4_SSL(EMAIL_IMAP_SERVER, EMAIL_IMAP_PORT)
-        mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
+        mail = imaplib.IMAP4_SSL(config.EMAIL_IMAP_SERVER, config.EMAIL_IMAP_PORT)
+        mail.login(config.EMAIL_ACCOUNT, config.EMAIL_PASSWORD)
         self._mail = mail
         return mail
 

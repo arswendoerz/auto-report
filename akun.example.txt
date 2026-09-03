@@ -1,0 +1,12 @@
+# Salin file ini menjadi akun.txt, lalu isi SATU blok per akun.
+# Jangan commit akun.txt karena file tersebut berisi kredensial.
+
+# AKUN 1
+TIKTOK_EMAIL=nama@example.com
+TIKTOK_PASSWORD=password-tiktok
+EMAIL_APP_PASSWORD=app-password-email
+
+# AKUN 2
+TIKTOK_EMAIL=nama-kedua@example.com
+TIKTOK_PASSWORD=password-tiktok-kedua
+EMAIL_APP_PASSWORD=app-password-email-kedua

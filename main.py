@@ -203,7 +203,17 @@ async def run_report(target_video_url: str, headless: bool = None, on_page=None)
             mobile_page = await mobile_context.new_page()
             await _announce_page(on_page, mobile_page)
 
-            await login_tiktok(mobile_page)
+            try:
+                login_ok = await login_tiktok(mobile_page)
+            except Exception as e:
+                login_ok = False
+                print(f"[ERROR] Login gagal: {e}")
+
+            if not login_ok:
+                await mobile_context.close()
+                print("[ERROR] Login tidak terkonfirmasi. Laporan dibatalkan.")
+                return False
+
             await mobile_context.storage_state(path=STORAGE_STATE_PATH)
             print(f"[LOGIN] Sesi disimpan ke {STORAGE_STATE_PATH}")
             await mobile_context.close()

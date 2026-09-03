@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+import time
 
 from playwright.async_api import Page
 
@@ -11,7 +12,7 @@ import config
 # (config.apply_credentials) ikut terbaca. Sisanya nilai statis.
 from config import FAST_TIMEOUT, SLOW_TIMEOUT, STORAGE_STATE_PATH
 from otp_utils import wait_for_new_otp, latest_tiktok_uid
-from perf import click_first, first_match
+from perf import POLL_INTERVAL, click_first, first_match
 from ui_selectors import APP_POPUP_SELECTORS, CAPTCHA_SELECTOR, LOGIN_BUTTON_SELECTORS
 
 LOGIN_SCREENSHOT_PATH = "tiktok_login_success.png"
@@ -179,14 +180,49 @@ async def _find_otp_input(page: Page):
     return page.locator(selectors[index]).first
 
 
-async def _handle_otp_verification(page: Page):
+async def _wait_for_logged_in(page: Page, timeout: int = SLOW_TIMEOUT) -> bool:
+    """Konfirmasi login berhasil sebelum sesi dipakai atau disimpan.
+
+    Tombol "Log masuk" SENGAJA tidak dianggap kesimpulan selama waktu tunggu
+    masih ada. Tepat setelah OTP dikirim, TikTok sempat merender header versi
+    anonim beberapa detik sebelum avatar muncul. Kalau tombol itu ikut
+    mengakhiri polling (perilaku lama: satu `first_match` atas gabungan semua
+    daftar, siapa pun yang terlihat duluan menang), login yang sebenarnya
+    berhasil dilaporkan gagal dan alur berhenti minta verifikasi manual.
+    Hanya pesan galat OTP/login yang menghentikan tunggu lebih awal.
+    """
+    fatal = OTP_ERROR_SELECTORS + LOGIN_ERROR_SELECTORS
+    deadline = time.monotonic() + timeout / 1000
+    while True:
+        # timeout=0: satu sapuan tanpa menunggu, ritme tunggu dipegang loop ini.
+        if await first_match(page, LOGGED_IN_SELECTORS, timeout=0) is not None:
+            return True
+        outcome = await first_match(page, fatal, timeout=0)
+        if outcome is not None:
+            if outcome < len(OTP_ERROR_SELECTORS):
+                print("[ERROR] TikTok menolak kode verifikasi.")
+            else:
+                print("[ERROR] Login ditolak oleh TikTok.")
+            return False
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(POLL_INTERVAL)
+
+    if await first_match(page, LOGIN_BUTTON_SELECTORS, timeout=0) is not None:
+        print("[ERROR] Halaman masih menampilkan tombol login.")
+    else:
+        print("[ERROR] Status login tidak dapat dikonfirmasi.")
+    return False
+
+
+async def _handle_otp_verification(page: Page) -> bool:
     detected = await first_match(page, VERIFY_SELECTORS, timeout=FAST_TIMEOUT) is not None
     if detected:
         print("[LOGIN] Halaman verifikasi terdeteksi.")
     else:
         print("[WARNING] Tidak ada halaman verifikasi terdeteksi otomatis.")
         input("Periksa browser. Jika sudah login, tekan Enter untuk lanjut...")
-        return
+        return await _wait_for_logged_in(page)
 
     # GARIS BATAS - harus dicatat SEBELUM kode diminta. Tanpa ini, polling
     # mengambil email TikTok terbaru yang ADA SAAT ITU, yang biasanya adalah
@@ -220,7 +256,7 @@ async def _handle_otp_verification(page: Page):
         print("[WARNING] Halaman OTP tidak muncul dan belum terlihat login.")
     elif outcome >= 2:
         print("[LOGIN] Sudah login, lewati OTP.")
-        return
+        return True
     else:
         print("[LOGIN] Halaman OTP muncul.")
 
@@ -228,7 +264,7 @@ async def _handle_otp_verification(page: Page):
     if otp_input is None:
         print("[ERROR] Field OTP tidak ditemukan. Isi manual.")
         input("Isi OTP manual di browser, lalu tekan Enter...")
-        return
+        return await _wait_for_logged_in(page)
 
     print("\n[OTP] Menunggu OTP terbaru...")
     # wait_for_new_otp() sinkron dan memakai time.sleep(); dijalankan di thread
@@ -240,7 +276,7 @@ async def _handle_otp_verification(page: Page):
         if not otp_code or len(otp_code) != 6 or not otp_code.isdigit():
             print("[ERROR] OTP tidak valid. Selesaikan login manual di browser.")
             input("Tekan Enter setelah login manual selesai...")
-            return
+            return await _wait_for_logged_in(page)
 
     try:
         await otp_input.fill(otp_code)
@@ -265,16 +301,14 @@ async def _handle_otp_verification(page: Page):
     else:
         print("[INFO] Tombol verifikasi tidak ditemukan (mungkin OTP auto-submit).")
 
-    outcome = await first_match(
-        page, LOGGED_IN_SELECTORS + OTP_ERROR_SELECTORS, timeout=SLOW_TIMEOUT
-    )
-    if outcome is not None and outcome >= len(LOGGED_IN_SELECTORS):
-        print("[ERROR] TikTok menolak kode: kedaluwarsa atau salah.")
-        print("[ERROR] Kode yang dipakai kemungkinan berasal dari email OTP lama.")
-        print("[ERROR] Tunggu hitung mundur 'Kirim ulang kode' selesai, lalu jalankan ulang.")
-        input("Atau selesaikan verifikasi manual di browser, lalu tekan Enter...")
-    elif outcome is None:
-        print("[WARNING] Status verifikasi tidak jelas - periksa jendela browser.")
+    # Redirect pasca-OTP ke beranda kerap lebih lama dari SLOW_TIMEOUT (10s),
+    # jadi jangan buru-buru melempar pengguna ke verifikasi manual.
+    if await _wait_for_logged_in(page, timeout=SLOW_TIMEOUT * 3):
+        return True
+
+    print("[WARNING] Selesaikan verifikasi manual di browser, lalu tekan Enter.")
+    input()
+    return await _wait_for_logged_in(page)
 
 
 async def login_tiktok(page: Page) -> bool:
@@ -310,13 +344,23 @@ async def login_tiktok(page: Page) -> bool:
 
     if outcome is not None and outcome < n_ok:
         print("[LOGIN] Login berhasil (tanpa verifikasi).")
+        success = True
     elif outcome is not None and outcome >= n_ok + n_verify + len(CAPTCHA_SELECTORS):
         print("[ERROR] Login ditolak (kredensial salah / terlalu banyak percobaan).")
         print("[ERROR] Periksa TIKTOK_EMAIL & TIKTOK_PASSWORD di .env.")
         return False
     else:
-        print("[LOGIN] Ada verifikasi, proses OTP...")
-        await _handle_otp_verification(page)
+        if outcome == n_ok + n_verify:
+            print("[LOGIN] Captcha terdeteksi.")
+            if not await check_and_solve_captcha(page):
+                print("[ERROR] Captcha belum terselesaikan.")
+                return False
+        print("[LOGIN] Memastikan verifikasi login selesai...")
+        success = await _handle_otp_verification(page)
+
+    if not success:
+        print("[ERROR] Login belum terkonfirmasi; sesi tidak akan disimpan.")
+        return False
 
     try:
         await page.screenshot(path=LOGIN_SCREENSHOT_PATH)

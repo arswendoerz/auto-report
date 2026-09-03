@@ -1,19 +1,4 @@
-"""GUI untuk auto-report TikTok.
-
-Tata letak:
-    kiri atas   - form kode/link video
-    kiri tengah - kredensial (email, password TikTok, app password) + tombol
-    kiri bawah  - log berjalan + kolom jawaban untuk langkah manual
-    kanan       - jendela Chromium yang dijalankan, ditempelkan ke dalam panel
-
-Jalankan: python gui.py
-
-Alur report-nya sendiri tetap milik main.run_report(); file ini hanya lapisan
-tampilan. Tiga jembatan yang menghubungkannya:
-  1. kredensial  -> config.apply_credentials()
-  2. log         -> sys.stdout dialihkan ke Queue lalu digambar Tk
-  3. input()     -> ditambal supaya bertanya di panel log, bukan di terminal
-"""
+"""GUI untuk menjalankan report TikTok dengan browser tertanam."""
 
 import asyncio
 import builtins
@@ -25,7 +10,7 @@ import sys
 import threading
 import tkinter as tk
 import traceback
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import config
 import main as report_main
@@ -33,9 +18,14 @@ import win_embed
 from tiktok_login import clear_session_file
 
 ENV_PATH = ".env"
+ACCOUNT_KEYS = (
+    "TIKTOK_EMAIL",
+    "TIKTOK_PASSWORD",
+    "EMAIL_APP_PASSWORD",
+)
+ACCOUNT_HEADER_PATTERN = re.compile(r"^\s*#\s*((?:akun|account)\b.*)$", re.I)
+ACCOUNT_VALUE_PATTERN = re.compile(r"^\s*([A-Z0-9_]+)\s*=\s*(.*)$")
 
-# Palet gelap. Merah TikTok dipakai hanya untuk aksi utama dan penanda error
-# supaya tetap gampang dibedakan dari teks biasa.
 BG = "#12141a"
 PANEL = "#1b1e26"
 FIELD = "#252935"
@@ -67,6 +57,10 @@ LOG_TAG_COLORS = {
 }
 
 TAG_PATTERN = re.compile(r"^\s*\[([A-Z]+)\]")
+
+# Batas tinggi yang diminta kolom kiri ke grid; lebih dari ini dialihkan ke
+# scrollbar supaya panel log tidak pernah tergusur habis.
+LEFT_MAX_HEIGHT = 560
 
 
 class StdoutToQueue:
@@ -108,7 +102,6 @@ class StdoutToQueue:
         return False
 
     def reconfigure(self, **kwargs):
-        # main.py dan report.py memanggil sys.stdout.reconfigure() di Windows.
         pass
 
     @property
@@ -142,6 +135,63 @@ def write_env_file(updates: dict, path=ENV_PATH):
         handle.write("\n".join(result).rstrip("\n") + "\n")
 
 
+def load_saved_accounts(path):
+    """Baca beberapa blok akun dari file yang dipilih pengguna.
+
+    Satu blok memakai empat variabel yang sama seperti .env. File tidak
+    pernah dibaca sebelum pengguna memilihnya melalui GUI. Baris header
+    opsional seperti ``# AKUN 1`` akan dipakai sebagai nama pada daftar GUI.
+    Blok baru juga otomatis dimulai saat ``TIKTOK_EMAIL`` berikutnya muncul.
+    """
+    if not path:
+        return None, [], None
+    source = path
+    if not os.path.isfile(source):
+        return source, [], "File tidak ditemukan."
+
+    try:
+        with io.open(source, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError as exc:
+        return source, [], str(exc)
+
+    accounts = []
+    values = {}
+    label = ""
+
+    def add_account():
+        nonlocal values, label
+        if not values:
+            return
+        email = values.get("TIKTOK_EMAIL", "").strip()
+        display = label.strip() or email or f"Akun {len(accounts) + 1}"
+        if email and email.lower() not in display.lower():
+            display = f"{display} — {email}"
+        accounts.append({"label": display, "values": values})
+        values = {}
+        label = ""
+
+    for raw_line in lines:
+        header = ACCOUNT_HEADER_PATTERN.match(raw_line)
+        if header:
+            add_account()
+            label = header.group(1).strip()
+            continue
+
+        match = ACCOUNT_VALUE_PATTERN.match(raw_line)
+        if not match:
+            continue
+        key, value = match.groups()
+        if key not in ACCOUNT_KEYS:
+            continue
+        if key == "TIKTOK_EMAIL" and "TIKTOK_EMAIL" in values:
+            add_account()
+        values[key] = value.strip()
+
+    add_account()
+    return source, accounts, None
+
+
 class ReportApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -154,26 +204,21 @@ class ReportApp:
         self.stopping = False
         self.waiting_input = False
 
-        # Jendela Chromium yang sudah ditempelkan. main.run_report() menjaga
-        # hanya satu context hidup pada satu waktu, tapi daftar ini tetap
-        # menyimpan riwayatnya: jendela lama disembunyikan, bukan diandaikan
-        # sudah mati, supaya tidak ada sisa jendela yang menumpuk di panel.
         self.embedded = []
         self.embed_lock = threading.Lock()
         self.embed_enabled = win_embed.IS_WINDOWS
         self.embed_seq = 0
-        # PID proses browser, dipelajari dari jendela pertama yang ketemu lewat
-        # penanda judul. Selama masih 0, pencarian tanpa judul tidak dilakukan.
         self.browser_pid = 0
         self.host_hwnd = None
         self.host_size = (900, 700)
+        self.saved_accounts = []
+        self.saved_accounts_path = None
+        self.active_account_index = None
+        self.session_needs_reset = False
 
         self._build_ui()
 
-        # Form kredensial SELALU dimulai kosong - tidak ada nilai bawaan dari
-        # .env. Nilai yang sudah termuat di config saat import ikut dikosongkan
-        # supaya tidak ada kredensial lama yang terpakai diam-diam kalau suatu
-        # saat ada jalur kode yang lupa memanggil apply_credentials().
+        # Jangan gunakan kredensial .env secara diam-diam di jalur GUI.
         config.apply_credentials("", "", "", "")
 
         self._original_stdout = sys.stdout
@@ -183,18 +228,22 @@ class ReportApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(80, self._drain_ui_queue)
 
-        self._log_line("[GUI] Siap. Isi kode video dan kredensial, lalu tekan Jalankan.")
+        self._log_line("[GUI] Siap. Pilih file akun atau isi kredensial, lalu tekan Jalankan.")
         if not win_embed.IS_WINDOWS:
             self._log_line("[GUI] Bukan Windows: browser akan tampil sebagai jendela terpisah.")
-
-    # ------------------------------------------------------------------ UI
 
     def _build_ui(self):
         root = self.root
         root.title("TikTok Auto Report")
         root.configure(bg=BG)
-        root.geometry("1420x860")
-        root.minsize(1120, 720)
+        # Ukuran awal harus sanggup memuat kolom kiri utuh + panel log, tapi
+        # tidak boleh melebihi layar: di laptop 1366x768 jendela 800px membuat
+        # baris jawaban OTP jatuh di bawah tepi layar. Kalau pengguna
+        # memperkecilnya, kolom kiri beralih ke mode gulir.
+        width = min(1280, max(1024, root.winfo_screenwidth() - 80))
+        height = min(800, max(560, root.winfo_screenheight() - 100))
+        root.geometry(f"{width}x{height}")
+        root.minsize(1024, 560)
 
         style = ttk.Style(root)
         try:
@@ -225,30 +274,137 @@ class ReportApp:
                         font=("Segoe UI Semibold", 10), borderwidth=0, padding=(10, 8))
         style.map("Run.TButton", background=[("active", "#ff4d70"), ("disabled", "#5c2233")],
                   foreground=[("disabled", "#b9a0a7")])
+        # Scrollbar clam bawaan berwarna terang; tanpa style ini ia menyala
+        # putih di tengah panel gelap.
+        style.configure("Dark.Vertical.TScrollbar", background=FIELD,
+                        troughcolor=PANEL, bordercolor=PANEL, arrowcolor=MUTED,
+                        darkcolor=FIELD, lightcolor=FIELD, borderwidth=0,
+                        relief="flat", width=12)
+        style.map("Dark.Vertical.TScrollbar",
+                  background=[("active", BORDER), ("pressed", BORDER)],
+                  arrowcolor=[("active", TEXT)])
         style.configure("Ghost.TButton", background=FIELD, foreground=TEXT,
                         font=("Segoe UI", 9), borderwidth=0, padding=(10, 8))
         style.map("Ghost.TButton", background=[("active", BORDER), ("disabled", "#1f222b")],
                   foreground=[("disabled", MUTED)])
 
-        root.columnconfigure(0, weight=0, minsize=460)
-        root.columnconfigure(1, weight=1)
-        root.rowconfigure(0, weight=1)
+        # uniform="main" membuat bobot dibaca sebagai proporsi lebar total,
+        # bukan cuma pembagian sisa ruang: kolom form 25%, panel browser 75%.
+        # minsize tetap jadi lantai supaya isi form tidak terjepit di jendela
+        # sempit (1024px), di mana 25% kurang dari lebar kartu.
+        root.columnconfigure(0, weight=1, uniform="main", minsize=320)
+        root.columnconfigure(1, weight=3, uniform="main")
+        root.rowconfigure(0, weight=2, minsize=260)
+        root.rowconfigure(1, weight=3, minsize=240)
 
-        left = ttk.Frame(root, padding=(14, 12, 7, 12))
-        left.grid(row=0, column=0, sticky="nsew")
-        left.columnconfigure(0, weight=1)
-        left.rowconfigure(3, weight=1)
+        left = self._build_left_column(root)
 
         self._build_target_card(left)
         self._build_credential_card(left)
         self._build_actions(left)
-        self._build_log_card(left)
+        self._bind_left_wheel()
+        self._sync_left_scroll()
 
         self._build_browser_panel(root)
+        self._build_log_card(root, row=1)
 
-    def _card(self, parent, title, row):
+    def _build_left_column(self, root):
+        """Bungkus kolom kiri dalam Canvas yang bisa digulir.
+
+        Tanpa ini tinggi baris grid dibagi menurut weight, jadi isi kolom kiri
+        terpotong begitu jendela lebih pendek dari kebutuhannya - tombol
+        Jalankan/Stop/Hapus Sesi ikut hilang, terutama saat input manual dibuka.
+        """
+        host = ttk.Frame(root)
+        host.grid(row=0, column=0, sticky="nsew")
+        host.rowconfigure(0, weight=1)
+        host.columnconfigure(0, weight=1)
+
+        # width kecil disengaja: lebar minta bawaan Canvas (378px) jadi lantai
+        # lebar kolom kiri dan menggagalkan pembagian 1/5 : 4/5 di grid root.
+        self.left_canvas = tk.Canvas(host, bg=BG, highlightthickness=0, bd=0,
+                                     takefocus=0, yscrollincrement=18, width=1)
+        self.left_canvas.grid(row=0, column=0, sticky="nsew")
+        self.left_scrollbar = ttk.Scrollbar(host, orient="vertical",
+                                            style="Dark.Vertical.TScrollbar",
+                                            command=self.left_canvas.yview)
+        self.left_canvas.configure(yscrollcommand=self.left_scrollbar.set)
+
+        # Padding bawah dibuat tipis: sisa ruang kosong di bawah tombol aksi
+        # bikin scrollbar muncul padahal tidak ada isi yang tersembunyi.
+        self.left_inner = ttk.Frame(self.left_canvas, padding=(14, 12, 7, 4))
+        self.left_inner.columnconfigure(0, weight=1)
+        self._left_window = self.left_canvas.create_window(
+            (0, 0), window=self.left_inner, anchor="nw"
+        )
+        self.left_inner.bind("<Configure>", lambda _event: self._sync_left_scroll())
+        self.left_canvas.bind("<Configure>", self._on_left_canvas_resize)
+        return self.left_inner
+
+    def _on_left_canvas_resize(self, event):
+        # Isi selalu selebar panel; hanya tingginya yang digulir.
+        self.left_canvas.itemconfigure(self._left_window, width=event.width)
+        self._sync_left_scroll()
+
+    def _sync_left_scroll(self):
+        """Scrollbar kiri hanya muncul saat isi memang lebih tinggi dari panel."""
+        needed = self.left_inner.winfo_reqheight()
+        visible = self.left_canvas.winfo_height()
+        if visible <= 1:
+            # Belum dipetakan; tinggi sebenarnya baru diketahui saat <Configure>.
+            return
+        self.left_canvas.configure(
+            scrollregion=(0, 0, self.left_canvas.winfo_width(), needed)
+        )
+        # Canvas tidak mewarisi tinggi isinya, jadi tanpa ini grid menganggap
+        # kolom kiri hampir tidak butuh ruang dan panel log memakan semuanya.
+        wanted = min(needed, LEFT_MAX_HEIGHT)
+        if int(self.left_canvas.cget("height")) != wanted:
+            self.left_canvas.configure(height=wanted)
+        # Toleransi kecil: sisa beberapa piksel di bawah cuma padding kartu,
+        # jangan sampai memicu scrollbar yang tidak perlu.
+        if needed > visible + 10:
+            if not self.left_scrollbar.winfo_ismapped():
+                self.left_scrollbar.grid(row=0, column=1, sticky="ns")
+        elif self.left_scrollbar.winfo_ismapped():
+            self.left_scrollbar.grid_remove()
+            self.left_canvas.yview_moveto(0)
+
+    def _bind_left_wheel(self):
+        """Roda mouse menggulir kolom kiri, tanpa mengganggu panel log."""
+        def on_wheel(event):
+            if not self.left_scrollbar.winfo_ismapped():
+                return None
+            if getattr(event, "num", 0) in (4, 5):
+                step = -3 if event.num == 4 else 3
+            else:
+                step = -3 if event.delta > 0 else 3
+            self.left_canvas.yview_scroll(step, "units")
+            return "break"
+
+        targets = [self.left_canvas, self.left_inner]
+        while targets:
+            widget = targets.pop()
+            for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                widget.bind(sequence, on_wheel, add="+")
+            targets.extend(widget.winfo_children())
+
+    def _wrap_with_parent(self, label, slack=0):
+        """Ikatkan wraplength ke lebar kontainer.
+
+        Nilai wraplength tetap membuat teks panjang (prompt OTP, label akun)
+        terpotong di kanan begitu jendela lebih sempit dari angka itu.
+        """
+        def resize(event):
+            width = max(event.width - slack, 160)
+            if int(label.cget("wraplength")) != width:
+                label.configure(wraplength=width)
+
+        label.master.bind("<Configure>", resize, add="+")
+
+    def _card(self, parent, title, row, columnspan=1):
         wrapper = ttk.Frame(parent)
-        wrapper.grid(row=row, column=0, sticky="nsew", pady=(0, 10))
+        wrapper.grid(row=row, column=0, columnspan=columnspan, sticky="nsew", pady=(0, 10))
         wrapper.columnconfigure(0, weight=1)
         ttk.Label(wrapper, text=title, style="Head.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 5)
@@ -282,21 +438,68 @@ class ReportApp:
         self.email_var = tk.StringVar()
         self.tiktok_password_var = tk.StringVar()
         self.app_password_var = tk.StringVar()
-        self.inbox_var = tk.StringVar()
 
-        self._labeled_entry(card, 0, "Email akun TikTok", self.email_var)
+        ttk.Label(card, text="File akun (opsional)").grid(
+            row=0, column=0, sticky="w"
+        )
+        picker = ttk.Frame(card, style="Card.TFrame")
+        picker.grid(row=1, column=0, sticky="ew", pady=(3, 3))
+        picker.columnconfigure(0, weight=1)
+        self.account_file_var = tk.StringVar(value="Belum ada file dipilih.")
+        file_entry = ttk.Entry(picker, textvariable=self.account_file_var, state="readonly")
+        file_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(
+            picker, text="Pilih file", style="Ghost.TButton",
+            command=self._choose_accounts_file,
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Button(
+            picker, text="Muat ulang", style="Ghost.TButton",
+            command=self._reload_saved_accounts,
+        ).grid(row=0, column=2, sticky="ew", padx=(8, 0))
+
+        ttk.Label(card, text="Akun aktif").grid(row=2, column=0, sticky="w")
+        self.active_account_var = tk.StringVar(value="Belum ada akun dimuat.")
+        active_label = ttk.Label(
+            card, textvariable=self.active_account_var, style="Muted.TLabel",
+            wraplength=380, justify="left",
+        )
+        active_label.grid(row=3, column=0, sticky="w", pady=(3, 3))
+        self._wrap_with_parent(active_label, slack=28)
+        self.next_account_button = ttk.Button(
+            card, text="Akun berikutnya", style="Ghost.TButton",
+            command=self._confirm_next_account, state="disabled",
+        )
+        self.next_account_button.grid(row=4, column=0, sticky="ew", pady=(2, 3))
+        self.account_source_var = tk.StringVar(
+            value="Pilih file dulu; kredensial tidak dibaca otomatis saat aplikasi dibuka."
+        )
+        source_label = ttk.Label(
+            card, textvariable=self.account_source_var, style="Muted.TLabel",
+            wraplength=380, justify="left",
+        )
+        source_label.grid(row=5, column=0, sticky="w", pady=(0, 5))
+        self._wrap_with_parent(source_label, slack=28)
+
+        self.manual_fields_visible = False
+        self.manual_fields_button = ttk.Button(
+            card, text="Tampilkan input manual", style="Ghost.TButton",
+            command=self._toggle_manual_fields,
+        )
+        self.manual_fields_button.grid(row=6, column=0, sticky="ew", pady=(2, 0))
+
+        self.manual_fields = ttk.Frame(card, style="Card.TFrame")
+        self.manual_fields.grid(row=7, column=0, sticky="ew", pady=(8, 0))
+        self.manual_fields.columnconfigure(0, weight=1)
+        self._labeled_entry(self.manual_fields, 0, "Email akun TikTok", self.email_var)
         self.tiktok_password_entry = self._labeled_entry(
-            card, 2, "Password TikTok", self.tiktok_password_var, secret=True
+            self.manual_fields, 2, "Password TikTok", self.tiktok_password_var, secret=True
         )
         self.app_password_entry = self._labeled_entry(
-            card, 4, "App Password Gmail (untuk baca OTP)", self.app_password_var, secret=True
-        )
-        self._labeled_entry(
-            card, 6, "Email inbox OTP (kosongkan kalau sama)", self.inbox_var
+            self.manual_fields, 4, "App Password Gmail (untuk baca OTP)", self.app_password_var, secret=True
         )
 
-        options = ttk.Frame(card, style="Card.TFrame")
-        options.grid(row=8, column=0, sticky="ew", pady=(8, 0))
+        options = ttk.Frame(self.manual_fields, style="Card.TFrame")
+        options.grid(row=6, column=0, sticky="ew", pady=(8, 0))
 
         self.show_secret_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -304,13 +507,128 @@ class ReportApp:
             command=self._toggle_secret, style="TCheckbutton",
         ).grid(row=0, column=0, sticky="w")
 
-        # Menulis .env TIDAK membuat form ini terisi otomatis di run berikutnya
-        # - .env hanya dibaca oleh jalur CLI (python main.py).
         self.save_env_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             options, text="Simpan ke .env (untuk CLI)", variable=self.save_env_var,
             style="TCheckbutton",
         ).grid(row=0, column=1, sticky="w", padx=(14, 0))
+        self.manual_fields.grid_remove()
+
+    def _choose_accounts_file(self):
+        """Minta pengguna memilih file sebelum kredensial dibaca."""
+        initial_dir = (
+            os.path.dirname(self.saved_accounts_path)
+            if self.saved_accounts_path else os.getcwd()
+        )
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Pilih file akun",
+            initialdir=initial_dir,
+            filetypes=[("File teks", "*.txt"), ("Semua file", "*.*")],
+        )
+        if path:
+            self._load_accounts_from_file(path)
+
+    def _reload_saved_accounts(self):
+        """Segarkan daftar dari file yang sebelumnya dipilih pengguna."""
+        if not self.saved_accounts_path:
+            self.account_source_var.set("Pilih file akun terlebih dahulu.")
+            return
+        self._load_accounts_from_file(self.saved_accounts_path)
+
+    def _load_accounts_from_file(self, path):
+        """Muat file lalu siapkan akun pertama, tanpa menjalankan report."""
+        source, accounts, error = load_saved_accounts(path)
+        self.saved_accounts = accounts
+        self.active_account_index = None
+        self.session_needs_reset = bool(os.path.exists(config.STORAGE_STATE_PATH))
+        self.active_account_var.set("Belum ada akun dimuat.")
+        self.next_account_button.configure(state="disabled")
+        self.account_file_var.set(source or "Belum ada file dipilih.")
+        if source:
+            self.saved_accounts_path = source
+
+        if error:
+            self.account_source_var.set("Gagal membaca file akun.")
+            self._log_line(f"[WARNING] Gagal membaca file akun: {error}")
+        elif accounts:
+            message = f"{len(accounts)} akun tersedia. Akun pertama telah dimuat ke formulir."
+            if self.session_needs_reset:
+                message += " Hapus sesi sebelum menjalankan akun ini."
+            self.account_source_var.set(message)
+            self._log_line(f"[GUI] {len(accounts)} akun tersedia dari file yang dipilih.")
+            self._set_active_account(0)
+        else:
+            self.account_source_var.set("Tidak ada blok akun yang terbaca dari file ini.")
+
+    def _set_active_account(self, index):
+        """Isi formulir dari satu akun yang dipilih oleh alur manual GUI."""
+        if index < 0 or index >= len(self.saved_accounts):
+            return
+
+        self.active_account_index = index
+        account = self.saved_accounts[index]
+        values = account["values"]
+        self.email_var.set(values.get("TIKTOK_EMAIL", ""))
+        self.tiktok_password_var.set(values.get("TIKTOK_PASSWORD", ""))
+        self.app_password_var.set(values.get("EMAIL_APP_PASSWORD", ""))
+        # Memilih profil tidak boleh membuat kredensial tak sengaja ditulis ke
+        # .env. Pengguna tetap dapat mencentang opsi itu dengan sadar.
+        self.save_env_var.set(False)
+        self.active_account_var.set(
+            f"{index + 1} dari {len(self.saved_accounts)} — {account['label']}"
+        )
+        self._refresh_next_account_button()
+        self._log_line(f"[GUI] Kredensial dimuat untuk akun {index + 1}.")
+
+    def _refresh_next_account_button(self):
+        index = self.active_account_index
+        has_next = index is not None and index + 1 < len(self.saved_accounts)
+        running = bool(self.worker and self.worker.is_alive())
+        self.next_account_button.configure(
+            state="normal" if has_next and not running else "disabled"
+        )
+
+    def _toggle_manual_fields(self):
+        self.manual_fields_visible = not self.manual_fields_visible
+        if self.manual_fields_visible:
+            self.manual_fields.grid()
+            self.manual_fields_button.configure(text="Sembunyikan input manual")
+        else:
+            self.manual_fields.grid_remove()
+            self.manual_fields_button.configure(text="Tampilkan input manual")
+        self.root.update_idletasks()
+        self._sync_left_scroll()
+
+    def _confirm_next_account(self):
+        """Minta persetujuan sebelum berpindah akun dan membuang sesi lama."""
+        if self.worker and self.worker.is_alive():
+            return
+        if self.active_account_index is None:
+            messagebox.showinfo("Belum ada akun", "Pilih file akun terlebih dahulu.", parent=self.root)
+            return
+
+        next_index = self.active_account_index + 1
+        if next_index >= len(self.saved_accounts):
+            messagebox.showinfo("Akun terakhir", "Tidak ada akun berikutnya.", parent=self.root)
+            return
+
+        next_label = self.saved_accounts[next_index]["label"]
+        confirmed = messagebox.askyesno(
+            "Pindah ke akun berikutnya",
+            "Muat akun berikutnya?\n\n"
+            "Sesi login TikTok yang tersimpan akan dihapus agar akun baru "
+            "dapat login saat Anda menjalankan report berikutnya.\n\n"
+            f"Akun berikutnya: {next_label}",
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+
+        if os.path.exists(config.STORAGE_STATE_PATH):
+            clear_session_file("berpindah ke akun berikutnya")
+        self.session_needs_reset = False
+        self._set_active_account(next_index)
 
     def _labeled_entry(self, card, row, label, variable, secret=False):
         ttk.Label(card, text=label).grid(row=row, column=0, sticky="w", pady=(4, 0))
@@ -320,7 +638,7 @@ class ReportApp:
 
     def _build_actions(self, parent):
         bar = ttk.Frame(parent)
-        bar.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        bar.grid(row=2, column=0, sticky="ew", pady=(0, 2))
         bar.columnconfigure(0, weight=1)
         bar.columnconfigure(1, weight=0)
         bar.columnconfigure(2, weight=0)
@@ -337,8 +655,16 @@ class ReportApp:
                                        command=self._clear_session)
         self.reset_button.grid(row=0, column=2, sticky="ew", padx=(8, 0))
 
-    def _build_log_card(self, parent):
-        card = self._card(parent, "3. Log", 3)
+    def _build_log_card(self, parent, row=3, columnspan=1):
+        # Kartu log menempel langsung ke root, jadi marjinnya dipasang sendiri.
+        # Marjin kanan disamakan dengan padding kolom kiri (7) supaya lebarnya
+        # persis sama dengan kartu Target Video dan Kredensial di atasnya.
+        holder = ttk.Frame(parent, padding=(14, 0, 7, 12))
+        holder.grid(row=row, column=0, columnspan=columnspan, sticky="nsew")
+        holder.columnconfigure(0, weight=1)
+        holder.rowconfigure(0, weight=1)
+
+        card = self._card(holder, "3. Log", 0)
         card.rowconfigure(0, weight=1)
 
         log_frame = tk.Frame(card, bg=BORDER, highlightthickness=0, bd=0)
@@ -348,19 +674,21 @@ class ReportApp:
 
         self.log = tk.Text(
             log_frame, bg="#0e1015", fg=TEXT, insertbackground=TEXT,
-            font=("Consolas", 9), wrap="word", relief="flat", padx=8, pady=6,
-            state="disabled", height=10,
+            font=("Consolas", 11), wrap="word", relief="flat", padx=8, pady=6,
+            state="disabled", height=7, width=1,
         )
         self.log.grid(row=0, column=0, sticky="nsew")
 
-        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
+        scrollbar = ttk.Scrollbar(log_frame, orient="vertical",
+                                  style="Dark.Vertical.TScrollbar",
+                                  command=self.log.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=scrollbar.set)
 
         for name, color in LOG_TAG_COLORS.items():
             self.log.tag_configure(name, foreground=color)
         self.log.tag_configure("PLAIN", foreground=TEXT)
-        self.log.tag_configure("PROMPT", foreground=WARN, font=("Consolas", 9, "bold"))
+        self.log.tag_configure("PROMPT", foreground=WARN, font=("Consolas", 11, "bold"))
 
         prompt_box = ttk.Frame(card, style="Card.TFrame")
         prompt_box.grid(row=1, column=0, sticky="ew", pady=(8, 0))
@@ -368,9 +696,10 @@ class ReportApp:
 
         self.prompt_var = tk.StringVar(value="Tidak ada langkah manual yang menunggu.")
         self.prompt_label = ttk.Label(prompt_box, textvariable=self.prompt_var,
-                                      style="Muted.TLabel", wraplength=400,
+                                      style="Muted.TLabel", wraplength=600,
                                       justify="left")
         self.prompt_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self._wrap_with_parent(self.prompt_label, slack=8)
 
         self.answer_var = tk.StringVar()
         self.answer_entry = ttk.Entry(prompt_box, textvariable=self.answer_var,
@@ -389,7 +718,9 @@ class ReportApp:
 
     def _build_browser_panel(self, root):
         right = ttk.Frame(root, padding=(7, 12, 14, 12))
-        right.grid(row=0, column=1, sticky="nsew")
+        # rowspan=2: panel browser memakai seluruh tinggi jendela di kolom
+        # kanan, sementara kolom kiri dibagi antara form dan log.
+        right.grid(row=0, column=1, rowspan=2, sticky="nsew")
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
 
@@ -403,7 +734,6 @@ class ReportApp:
         ttk.Label(header, textvariable=self.status_var, style="Status.TLabel",
                   anchor="e").grid(row=0, column=1, sticky="e")
 
-        # Frame inilah yang jadi induk jendela Chromium (lihat win_embed.embed).
         self.browser_host = tk.Frame(right, bg="#0b0d11", highlightthickness=1,
                                      highlightbackground=BORDER, bd=0)
         self.browser_host.grid(row=1, column=0, sticky="nsew")
@@ -416,8 +746,6 @@ class ReportApp:
             bg="#0b0d11", fg=MUTED, font=("Segoe UI", 10), justify="center",
         )
         self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
-
-    # -------------------------------------------------------------- helpers
 
     def _toggle_secret(self):
         show = "" if self.show_secret_var.get() else "•"
@@ -446,8 +774,6 @@ class ReportApp:
             current = self.embedded[-1] if self.embedded else None
         if current:
             win_embed.resize(current, *self.host_size)
-
-    # ------------------------------------------------------- input dari GUI
 
     def _gui_input(self, prompt: str = "") -> str:
         """Ganti input() bawaan: bertanya di panel log, bukan di terminal.
@@ -489,15 +815,22 @@ class ReportApp:
         self.answer_button.configure(state="normal")
         self.answer_entry.focus_set()
 
-    # ------------------------------------------------------------ menjalankan
-
     def _collect_inputs(self):
         """Validasi form. Return (url, error_message)."""
         raw_video = self.video_var.get()
         email = self.email_var.get().strip()
         tiktok_password = self.tiktok_password_var.get()
         app_password = self.app_password_var.get().strip()
-        inbox = self.inbox_var.get().strip() or email
+        inbox = email
+
+        if self.active_account_index is not None and self.session_needs_reset:
+            if not os.path.exists(config.STORAGE_STATE_PATH):
+                self.session_needs_reset = False
+            else:
+                return None, (
+                    "Sesi login dari akun sebelumnya masih tersimpan.\n\n"
+                    "Klik 'Hapus Sesi' sebelum menjalankan akun yang baru dimuat."
+                )
 
         if not raw_video.strip():
             return None, "Kode/link video belum diisi."
@@ -560,6 +893,8 @@ class ReportApp:
 
         self.run_button.configure(state="disabled")
         self.reset_button.configure(state="disabled")
+        # Sebelumnya tombol ini tetap terlihat aktif tapi diam saja saat run.
+        self.next_account_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self._set_status("Menjalankan...")
         self._log_line("=" * 58)
@@ -673,6 +1008,7 @@ class ReportApp:
         self.run_button.configure(state="normal")
         self.reset_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
+        self._refresh_next_account_button()
         self._set_prompt_idle()
         self._release_embedded()
         self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
@@ -691,6 +1027,7 @@ class ReportApp:
         if self.worker and self.worker.is_alive():
             return
         if not os.path.exists(config.STORAGE_STATE_PATH):
+            self.session_needs_reset = False
             self._log_line("[SESI] Tidak ada file sesi tersimpan.")
             return
         confirm = messagebox.askyesno(
@@ -701,9 +1038,8 @@ class ReportApp:
             parent=self.root,
         )
         if confirm:
-            clear_session_file("dihapus dari GUI")
-
-    # ------------------------------------------------------------- ui queue
+            if clear_session_file("dihapus dari GUI"):
+                self.session_needs_reset = False
 
     def _drain_ui_queue(self):
         # Dibatasi per siklus supaya banjir log tidak membekukan jendela.
@@ -727,8 +1063,6 @@ class ReportApp:
                 self._finish(bool(payload))
 
         self.root.after(80, self._drain_ui_queue)
-
-    # --------------------------------------------------------------- penutup
 
     def _on_close(self):
         if self.worker and self.worker.is_alive():

@@ -18,13 +18,13 @@ import win_embed
 from tiktok_login import clear_session_file
 
 ENV_PATH = ".env"
-ACCOUNT_KEYS = (
-    "TIKTOK_EMAIL",
-    "TIKTOK_PASSWORD",
-    "EMAIL_APP_PASSWORD",
-)
-ACCOUNT_HEADER_PATTERN = re.compile(r"^\s*#\s*((?:akun|account)\b.*)$", re.I)
-ACCOUNT_VALUE_PATTERN = re.compile(r"^\s*([A-Z0-9_]+)\s*=\s*(.*)$")
+# Jeda sebelum report berjalan otomatis setelah akun berganti. Memberi waktu
+# log tampil dan memastikan worker sebelumnya benar-benar sudah berhenti.
+AUTO_START_DELAY_MS = 1200
+ACCOUNT_KEYS = config.ACCOUNT_KEYS
+ACCOUNT_HEADER_PATTERN = config.ACCOUNT_HEADER_PATTERN
+ACCOUNT_VALUE_PATTERN = config.ACCOUNT_VALUE_PATTERN
+load_saved_accounts = config.load_saved_accounts
 
 BG = "#12141a"
 PANEL = "#1b1e26"
@@ -135,63 +135,6 @@ def write_env_file(updates: dict, path=ENV_PATH):
         handle.write("\n".join(result).rstrip("\n") + "\n")
 
 
-def load_saved_accounts(path):
-    """Baca beberapa blok akun dari file yang dipilih pengguna.
-
-    Satu blok memakai empat variabel yang sama seperti .env. File tidak
-    pernah dibaca sebelum pengguna memilihnya melalui GUI. Baris header
-    opsional seperti ``# AKUN 1`` akan dipakai sebagai nama pada daftar GUI.
-    Blok baru juga otomatis dimulai saat ``TIKTOK_EMAIL`` berikutnya muncul.
-    """
-    if not path:
-        return None, [], None
-    source = path
-    if not os.path.isfile(source):
-        return source, [], "File tidak ditemukan."
-
-    try:
-        with io.open(source, encoding="utf-8") as handle:
-            lines = handle.read().splitlines()
-    except OSError as exc:
-        return source, [], str(exc)
-
-    accounts = []
-    values = {}
-    label = ""
-
-    def add_account():
-        nonlocal values, label
-        if not values:
-            return
-        email = values.get("TIKTOK_EMAIL", "").strip()
-        display = label.strip() or email or f"Akun {len(accounts) + 1}"
-        if email and email.lower() not in display.lower():
-            display = f"{display} — {email}"
-        accounts.append({"label": display, "values": values})
-        values = {}
-        label = ""
-
-    for raw_line in lines:
-        header = ACCOUNT_HEADER_PATTERN.match(raw_line)
-        if header:
-            add_account()
-            label = header.group(1).strip()
-            continue
-
-        match = ACCOUNT_VALUE_PATTERN.match(raw_line)
-        if not match:
-            continue
-        key, value = match.groups()
-        if key not in ACCOUNT_KEYS:
-            continue
-        if key == "TIKTOK_EMAIL" and "TIKTOK_EMAIL" in values:
-            add_account()
-        values[key] = value.strip()
-
-    add_account()
-    return source, accounts, None
-
-
 class ReportApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -215,6 +158,18 @@ class ReportApp:
         self.saved_accounts_path = None
         self.active_account_index = None
         self.session_needs_reset = False
+        self._rotate_timer = None
+        self._last_ran_account_index = None
+        self.email_account_value = ""
+
+        # Batch-run state (satu klik Jalankan untuk semua akun)
+        self._batch_running = False
+        self._batch_url = None
+        self._batch_start_index = None
+        self._batch_success = 0
+        self._batch_fail = 0
+        # Rincian per akun: (nomor, label, berhasil, catatan)
+        self._batch_results = []
 
         self._build_ui()
 
@@ -228,7 +183,10 @@ class ReportApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(80, self._drain_ui_queue)
 
-        self._log_line("[GUI] Siap. Pilih file akun atau isi kredensial, lalu tekan Jalankan.")
+        # Tidak ada file akun default: pengguna harus memilih sendiri lewat
+        # tombol "Pilih File". Memuat akun.txt diam-diam membuat kredensial
+        # milik orang lain ikut terpakai kalau file itu tertinggal di folder.
+        self._log_line("[GUI] Siap. Pilih file akun atau isi kredensial manual, lalu tekan Jalankan.")
         if not win_embed.IS_WINDOWS:
             self._log_line("[GUI] Bukan Windows: browser akan tampil sebagai jendela terpisah.")
 
@@ -467,9 +425,18 @@ class ReportApp:
         self._wrap_with_parent(active_label, slack=28)
         self.next_account_button = ttk.Button(
             card, text="Akun berikutnya", style="Ghost.TButton",
-            command=self._confirm_next_account, state="disabled",
+            command=self._next_account_and_run, state="disabled",
         )
         self.next_account_button.grid(row=4, column=0, sticky="ew", pady=(2, 3))
+
+        self.auto_rotate_var = tk.BooleanVar(value=True)
+        self.auto_rotate_check = ttk.Checkbutton(
+            card, text="Rotasi otomatis ke akun berikutnya",
+            variable=self.auto_rotate_var, style="TCheckbutton",
+            command=self._on_auto_rotate_toggle,
+        )
+        self.auto_rotate_check.grid(row=5, column=0, sticky="w", pady=(2, 3))
+
         self.account_source_var = tk.StringVar(
             value="Pilih file dulu; kredensial tidak dibaca otomatis saat aplikasi dibuka."
         )
@@ -477,7 +444,7 @@ class ReportApp:
             card, textvariable=self.account_source_var, style="Muted.TLabel",
             wraplength=380, justify="left",
         )
-        source_label.grid(row=5, column=0, sticky="w", pady=(0, 5))
+        source_label.grid(row=6, column=0, sticky="w", pady=(0, 5))
         self._wrap_with_parent(source_label, slack=28)
 
         self.manual_fields_visible = False
@@ -485,10 +452,10 @@ class ReportApp:
             card, text="Tampilkan input manual", style="Ghost.TButton",
             command=self._toggle_manual_fields,
         )
-        self.manual_fields_button.grid(row=6, column=0, sticky="ew", pady=(2, 0))
+        self.manual_fields_button.grid(row=7, column=0, sticky="ew", pady=(2, 0))
 
         self.manual_fields = ttk.Frame(card, style="Card.TFrame")
-        self.manual_fields.grid(row=7, column=0, sticky="ew", pady=(8, 0))
+        self.manual_fields.grid(row=8, column=0, sticky="ew", pady=(8, 0))
         self.manual_fields.columnconfigure(0, weight=1)
         self._labeled_entry(self.manual_fields, 0, "Email akun TikTok", self.email_var)
         self.tiktok_password_entry = self._labeled_entry(
@@ -553,8 +520,6 @@ class ReportApp:
             self._log_line(f"[WARNING] Gagal membaca file akun: {error}")
         elif accounts:
             message = f"{len(accounts)} akun tersedia. Akun pertama telah dimuat ke formulir."
-            if self.session_needs_reset:
-                message += " Hapus sesi sebelum menjalankan akun ini."
             self.account_source_var.set(message)
             self._log_line(f"[GUI] {len(accounts)} akun tersedia dari file yang dipilih.")
             self._set_active_account(0)
@@ -581,6 +546,12 @@ class ReportApp:
         self._refresh_next_account_button()
         self._log_line(f"[GUI] Kredensial dimuat untuk akun {index + 1}.")
 
+    def _on_auto_rotate_toggle(self):
+        if not self.auto_rotate_var.get() and self._rotate_timer is not None:
+            self._cancel_auto_start()
+            self._log_line("[GUI] Rotasi otomatis dimatikan, auto-run dibatalkan.")
+            self._halt_auto(ok=False)
+
     def _refresh_next_account_button(self):
         index = self.active_account_index
         has_next = index is not None and index + 1 < len(self.saved_accounts)
@@ -600,35 +571,65 @@ class ReportApp:
         self.root.update_idletasks()
         self._sync_left_scroll()
 
-    def _confirm_next_account(self):
-        """Minta persetujuan sebelum berpindah akun dan membuang sesi lama."""
+    def _next_account(self):
+        """Pindah ke akun berikutnya tanpa konfirmasi - hapus sesi lama langsung.
+
+        Return True kalau akun benar-benar berpindah.
+        """
         if self.worker and self.worker.is_alive():
-            return
+            return False
         if self.active_account_index is None:
-            messagebox.showinfo("Belum ada akun", "Pilih file akun terlebih dahulu.", parent=self.root)
-            return
+            return False
 
         next_index = self.active_account_index + 1
         if next_index >= len(self.saved_accounts):
-            messagebox.showinfo("Akun terakhir", "Tidak ada akun berikutnya.", parent=self.root)
-            return
-
-        next_label = self.saved_accounts[next_index]["label"]
-        confirmed = messagebox.askyesno(
-            "Pindah ke akun berikutnya",
-            "Muat akun berikutnya?\n\n"
-            "Sesi login TikTok yang tersimpan akan dihapus agar akun baru "
-            "dapat login saat Anda menjalankan report berikutnya.\n\n"
-            f"Akun berikutnya: {next_label}",
-            parent=self.root,
-        )
-        if not confirmed:
-            return
+            self._log_line("[GUI] Sudah di akun terakhir, tidak ada akun berikutnya.")
+            return False
 
         if os.path.exists(config.STORAGE_STATE_PATH):
             clear_session_file("berpindah ke akun berikutnya")
         self.session_needs_reset = False
         self._set_active_account(next_index)
+        self._log_line(f"[GUI] Beralih ke akun {next_index + 1} dari {len(self.saved_accounts)}.")
+        return True
+
+    def _next_account_and_run(self):
+        """Tombol 'Akun Berikutnya': ganti akun lalu jalankan report otomatis."""
+        if not self._next_account():
+            return
+        self._queue_auto_start(f"akun {self.active_account_index + 1}")
+
+    def _cancel_auto_start(self):
+        """Batalkan auto-start yang masih menunggu di timer Tk."""
+        timer, self._rotate_timer = self._rotate_timer, None
+        if timer is not None:
+            try:
+                self.root.after_cancel(timer)
+            except Exception:
+                pass
+
+    def _queue_auto_start(self, reason: str):
+        """Antrikan "klik" Jalankan Report otomatis setelah akun berganti."""
+        self._cancel_auto_start()
+        if self.worker and self.worker.is_alive():
+            return
+        if not self.auto_rotate_var.get():
+            self._log_line("[GUI] Rotasi otomatis mati - tekan Jalankan Report bila mau lanjut.")
+            self._halt_auto(ok=False)
+            return
+        if not self.video_var.get().strip():
+            self._log_line("[WARNING] Kode/link video belum diisi, report tidak dijalankan otomatis.")
+            self._halt_auto(ok=False)
+            return
+        self._log_line(f"[GUI] Report berjalan otomatis untuk {reason}...")
+        self._set_status(f"Menyiapkan report otomatis ({reason})...")
+        self._rotate_timer = self.root.after(AUTO_START_DELAY_MS, self._auto_start_now)
+
+    def _auto_start_now(self):
+        self._rotate_timer = None
+        if self.worker and self.worker.is_alive():
+            return
+        self._start(auto=True)
 
     def _labeled_entry(self, card, row, label, variable, secret=False):
         ttk.Label(card, text=label).grid(row=row, column=0, sticky="w", pady=(4, 0))
@@ -827,10 +828,10 @@ class ReportApp:
             if not os.path.exists(config.STORAGE_STATE_PATH):
                 self.session_needs_reset = False
             else:
-                return None, (
-                    "Sesi login dari akun sebelumnya masih tersimpan.\n\n"
-                    "Klik 'Hapus Sesi' sebelum menjalankan akun yang baru dimuat."
-                )
+                # Hapus sesi otomatis saat rotasi akun
+                self._log_line("[GUI] Sesi akun sebelumnya dihapus otomatis untuk rotasi akun.")
+                clear_session_file("rotasi akun otomatis")
+                self.session_needs_reset = False
 
         if not raw_video.strip():
             return None, "Kode/link video belum diisi."
@@ -868,15 +869,106 @@ class ReportApp:
 
         return url, None
 
-    def _start(self):
+    def _start(self, auto: bool = False):
         if self.worker and self.worker.is_alive():
             return
+        if not auto:
+            # Klik manual membatalkan auto-start yang masih menunggu.
+            self._cancel_auto_start()
 
         url, error = self._collect_inputs()
         if error:
-            messagebox.showwarning("Belum bisa dijalankan", error, parent=self.root)
+            if not auto:
+                messagebox.showwarning("Belum bisa dijalankan", error, parent=self.root)
+                return
+            # Jalur otomatis tidak boleh membuka dialog modal: dialog itu
+            # menghentikan seluruh batch sampai ada orang yang menutupnya.
+            self._log_line(f"[ERROR] Akun ini dilewati: {error.splitlines()[0]}")
+            self._skip_current_account()
             return
 
+        # Inisialisasi sesi batch baru setiap kali user menekan tombol
+        if not self._batch_running:
+            self._batch_running = True
+            self._batch_url = url
+            self._batch_start_index = self.active_account_index
+            self._batch_success = 0
+            self._batch_fail = 0
+            self._batch_results = []
+            total = len(self.saved_accounts)
+            cur = (self.active_account_index or 0) + 1
+            remaining = total - (self.active_account_index or 0)
+            self._log_line(
+                f"[GUI] Batch dimulai: {remaining} akun akan dijalankan "
+                f"(akun {cur}–{total})."
+            )
+
+        self._start_run(self._batch_url or url)
+
+    def _account_label(self):
+        """Nama akun untuk baris ringkasan; jatuh ke email/manual bila perlu."""
+        index = self.active_account_index
+        if index is not None and 0 <= index < len(self.saved_accounts):
+            return self.saved_accounts[index].get("label") or f"akun {index + 1}"
+        return self.email_var.get().strip() or "input manual"
+
+    def _record_result(self, ok: bool, note: str = ""):
+        """Catat hasil satu akun supaya ringkasan akhir bisa dirinci."""
+        if ok:
+            self._batch_success += 1
+        else:
+            self._batch_fail += 1
+        number = (self.active_account_index or 0) + 1
+        self._batch_results.append((number, self._account_label(), ok, note))
+
+    def _skip_current_account(self):
+        """Data akun tidak lengkap di jalur otomatis: hitung gagal lalu lanjut."""
+        if self._batch_running:
+            self._record_result(False, "data akun tidak lengkap")
+        if self._can_rotate():
+            self._next_account()
+            self._queue_auto_start(f"akun {self.active_account_index + 1}")
+            return
+        self._end_batch(ok=False)
+
+    def _halt_auto(self, ok: bool):
+        """Auto-run tidak bisa lanjut: tutup batch kalau ada, kalau tidak
+        cukup pulihkan tombol supaya user bisa lanjut manual."""
+        if self._batch_running:
+            self._end_batch(ok=ok)
+        else:
+            self.run_button.configure(state="normal")
+            self.reset_button.configure(state="normal")
+            self.stop_button.configure(state="disabled")
+            self._refresh_next_account_button()
+
+    def _can_rotate(self) -> bool:
+        """True kalau rotasi otomatis aktif dan masih ada akun berikutnya."""
+        return bool(
+            self.auto_rotate_var.get()
+            and self.active_account_index is not None
+            and (self.active_account_index + 1) < len(self.saved_accounts)
+        )
+
+    def _end_batch(self, ok: bool, stopped: bool = False):
+        """Tutup batch: cetak ringkasan bila perlu, lalu aktifkan tombol lagi."""
+        self._cancel_auto_start()
+        was_batch = self._batch_running
+        self._batch_running = False
+        if was_batch and self._batch_results:
+            self._print_batch_summary(stopped=stopped)
+        if stopped:
+            self._set_status("Dihentikan")
+        else:
+            self._set_status("Laporan terkirim" if ok else "Selesai - belum terkonfirmasi")
+        self.run_button.configure(state="normal")
+        self.reset_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
+        self._refresh_next_account_button()
+
+    def _start_run(self, url: str):
+        """Jalankan satu siklus report (dipakai oleh _start dan auto-continue)."""
+        self._cancel_auto_start()
         self.stopping = False
         self.embed_seq = 0
         self.browser_pid = 0
@@ -893,12 +985,13 @@ class ReportApp:
 
         self.run_button.configure(state="disabled")
         self.reset_button.configure(state="disabled")
-        # Sebelumnya tombol ini tetap terlihat aktif tapi diam saja saat run.
         self.next_account_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
-        self._set_status("Menjalankan...")
+        cur = (self.active_account_index or 0) + 1
+        total = len(self.saved_accounts) or 1
+        self._set_status(f"Menjalankan... (akun {cur}/{total})")
         self._log_line("=" * 58)
-        self._log_line(f"[GUI] Target: {url}")
+        self._log_line(f"[GUI] Akun {cur}/{total} — target: {url}")
 
         builtins.input = self._gui_input
         # headless dipaksa mati: jendela yang tidak digambar tidak bisa
@@ -985,7 +1078,14 @@ class ReportApp:
             self.embed_enabled = False
 
     def _stop(self):
+        # Stop harus ikut mematikan auto-start yang menunggu di timer, kalau
+        # tidak batch hidup lagi sesaat setelah user menekan Stop.
+        pending = self._rotate_timer is not None
+        self._cancel_auto_start()
         if not (self.worker and self.worker.is_alive()):
+            if pending:
+                self._log_line("[GUI] Auto-run dibatalkan.")
+                self._end_batch(ok=False, stopped=True)
             return
         self.stopping = True
         self._set_status("Menghentikan...")
@@ -1004,18 +1104,66 @@ class ReportApp:
             self._set_prompt_idle()
 
     def _finish(self, ok: bool):
+        # Event "done" dikirim worker dari blok finally, jadi thread-nya bisa
+        # masih is_alive() sesaat di sini. Lepaskan referensinya lebih dulu
+        # supaya guard is_alive() di jalur rotasi tidak menggantung batch.
+        worker, self.worker = self.worker, None
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=2)
+
         builtins.input = self._original_input
-        self.run_button.configure(state="normal")
-        self.reset_button.configure(state="normal")
-        self.stop_button.configure(state="disabled")
-        self._refresh_next_account_button()
         self._set_prompt_idle()
         self._release_embedded()
         self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
+
         if self.stopping:
-            self._set_status("Dihentikan")
-        else:
-            self._set_status("Laporan terkirim" if ok else "Selesai - belum terkonfirmasi")
+            # User menekan Stop - akhiri batch dan tampilkan ringkasan parsial
+            self._end_batch(ok=False, stopped=True)
+            return
+
+        # Catat hasil run ini
+        if self._batch_running:
+            self._record_result(ok)
+
+        if self._batch_running and self._can_rotate():
+            self._next_account()
+            self._queue_auto_start(f"akun {self.active_account_index + 1}")
+            return
+
+        # Semua akun selesai atau rotasi otomatis dimatikan
+        self._end_batch(ok=ok)
+
+    def _print_batch_summary(self, stopped: bool = False):
+        """Cetak ringkasan hasil batch ke panel log setelah semua akun selesai."""
+        total = self._batch_success + self._batch_fail
+        pending = max(len(self.saved_accounts) - total, 0) if self.saved_accounts else 0
+
+        self._log_line("=" * 58)
+        self._log_line("[GUI] ===== RINGKASAN BATCH =====")
+        if stopped:
+            self._log_line("[WARNING] Batch dihentikan sebelum semua akun selesai.")
+
+        # Rincian per akun lebih dulu, supaya angka totalnya bisa ditelusuri.
+        for number, label, ok, note in self._batch_results:
+            if ok:
+                self._log_line(f"[SUCCESS] Akun {number} - {label}: BERHASIL")
+            else:
+                alasan = f" ({note})" if note else ""
+                self._log_line(f"[ERROR] Akun {number} - {label}: GAGAL{alasan}")
+
+        self._log_line("-" * 58)
+        # Tag log ikut tampil di panel, jadi padding dihitung bersama tag-nya
+        # supaya titik dua tetap sejajar walau warna tiap baris berbeda.
+        rows = [
+            ("[GUI]", "Total akun dijalankan", total),
+            ("[SUCCESS]", "Berhasil", self._batch_success),
+            ("[ERROR]", "Gagal/tidak konfirmasi", self._batch_fail),
+        ]
+        if pending:
+            rows.append(("[WARNING]", "Belum dijalankan", pending))
+        for prefix, label, value in rows:
+            self._log_line(f"{prefix} {label}".ljust(34) + f": {value}")
+        self._log_line("=" * 58)
 
     def _release_embedded(self):
         with self.embed_lock:
@@ -1030,16 +1178,8 @@ class ReportApp:
             self.session_needs_reset = False
             self._log_line("[SESI] Tidak ada file sesi tersimpan.")
             return
-        confirm = messagebox.askyesno(
-            "Hapus sesi login",
-            f"Hapus {config.STORAGE_STATE_PATH}?\n\n"
-            "Run berikutnya wajib login penuh, dan login baru berulang adalah "
-            "pemicu utama munculnya OTP serta captcha.",
-            parent=self.root,
-        )
-        if confirm:
-            if clear_session_file("dihapus dari GUI"):
-                self.session_needs_reset = False
+        if clear_session_file("dihapus dari GUI"):
+            self.session_needs_reset = False
 
     def _drain_ui_queue(self):
         # Dibatasi per siklus supaya banjir log tidak membekukan jendela.
@@ -1065,6 +1205,7 @@ class ReportApp:
         self.root.after(80, self._drain_ui_queue)
 
     def _on_close(self):
+        self._cancel_auto_start()
         if self.worker and self.worker.is_alive():
             if not messagebox.askyesno(
                 "Masih berjalan",

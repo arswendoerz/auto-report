@@ -5,12 +5,74 @@ memaksa keluar saat import: gui.py mengisinya dari form lewat
 apply_credentials(), jadi validasi dipindah ke pemanggil (require_credentials()).
 """
 
+import io
 import os
+import re
 import sys
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+ACCOUNT_KEYS = (
+    "TIKTOK_EMAIL",
+    "TIKTOK_PASSWORD",
+    "EMAIL_ACCOUNT",
+    "EMAIL_APP_PASSWORD",
+)
+ACCOUNT_HEADER_PATTERN = re.compile(r"^\s*#\s*((?:akun|account)\b.*)$", re.I)
+ACCOUNT_VALUE_PATTERN = re.compile(r"^\s*([A-Z0-9_]+)\s*=\s*(.*)$")
+
+
+def load_saved_accounts(path):
+    """Baca beberapa blok akun dari file teks (mis. akun.txt)."""
+    if not path:
+        return None, [], None
+    source = path
+    if not os.path.isfile(source):
+        return source, [], "File tidak ditemukan."
+
+    try:
+        with io.open(source, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError as exc:
+        return source, [], str(exc)
+
+    accounts = []
+    values = {}
+    label = ""
+
+    def add_account():
+        nonlocal values, label
+        if not values:
+            return
+        email = values.get("TIKTOK_EMAIL", "").strip()
+        display = label.strip() or email or f"Akun {len(accounts) + 1}"
+        if email and email.lower() not in display.lower():
+            display = f"{display} — {email}"
+        accounts.append({"label": display, "values": values})
+        values = {}
+        label = ""
+
+    for raw_line in lines:
+        header = ACCOUNT_HEADER_PATTERN.match(raw_line)
+        if header:
+            add_account()
+            label = header.group(1).strip()
+            continue
+
+        match = ACCOUNT_VALUE_PATTERN.match(raw_line)
+        if not match:
+            continue
+        key, value = match.groups()
+        if key not in ACCOUNT_KEYS:
+            continue
+        if key == "TIKTOK_EMAIL" and "TIKTOK_EMAIL" in values:
+            add_account()
+        values[key] = value.strip()
+
+    add_account()
+    return source, accounts, None
 
 
 def _flag(name: str, default: bool) -> bool:

@@ -24,7 +24,15 @@ from config import (
     AUTO_CLEAR_STALE_SESSION,
 )
 from perf import Stopwatch, block_heavy_resources
-from tiktok_login import login_tiktok, is_logged_in, logout_tiktok, clear_session_file
+from tiktok_login import (
+    login_tiktok,
+    is_logged_in,
+    logout_tiktok,
+    clear_session_file,
+    save_session_owner,
+    session_belongs_to,
+    session_owner,
+)
 import report
 
 LAUNCH_ARGS = [
@@ -172,6 +180,16 @@ async def run_report(target_video_url: str, headless: bool = None, on_page=None)
         #   sesi ada    -> context desktop saja, langsung report (kasus umum)
         #   sesi kosong -> context mobile (login), TUTUP, baru context desktop
         has_saved_session = os.path.exists(STORAGE_STATE_PATH)
+        # is_logged_in() tidak bisa membedakan akun, jadi kepemilikan sesi
+        # diperiksa dari catatan di disk. Kalau tidak cocok, sesi lama dibuang
+        # supaya login memakai akun yang sekarang aktif - bukan akun sebelumnya.
+        if has_saved_session and not session_belongs_to(config.TIKTOK_EMAIL):
+            owner = session_owner()
+            milik = owner if owner else "akun yang tidak tercatat"
+            print(f"[SESI] Sesi tersimpan milik {milik}, bukan {config.TIKTOK_EMAIL}.")
+            clear_session_file("sesi milik akun lain")
+            has_saved_session = False
+
         context = None
         page = None
         logged_in = False
@@ -215,7 +233,9 @@ async def run_report(target_video_url: str, headless: bool = None, on_page=None)
                 return False
 
             await mobile_context.storage_state(path=STORAGE_STATE_PATH)
-            print(f"[LOGIN] Sesi disimpan ke {STORAGE_STATE_PATH}")
+            save_session_owner(config.TIKTOK_EMAIL)
+            print(f"[LOGIN] Sesi disimpan ke {STORAGE_STATE_PATH} "
+                  f"(akun {config.TIKTOK_EMAIL})")
             await mobile_context.close()
 
             # Report WAJIB di layout desktop: menu titik-tiga yang memuat opsi
@@ -257,6 +277,7 @@ async def run_report(target_video_url: str, headless: bool = None, on_page=None)
             else:
                 try:
                     await context.storage_state(path=STORAGE_STATE_PATH)
+                    save_session_owner(config.TIKTOK_EMAIL)
                 except Exception:
                     pass
 

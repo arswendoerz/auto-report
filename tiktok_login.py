@@ -1,6 +1,7 @@
 """Alur login TikTok (email + password + verifikasi OTP), logout, dan cek sesi."""
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -16,6 +17,12 @@ from perf import POLL_INTERVAL, click_first, first_match
 from ui_selectors import APP_POPUP_SELECTORS, CAPTCHA_SELECTOR, LOGIN_BUTTON_SELECTORS
 
 LOGIN_SCREENSHOT_PATH = "tiktok_login_success.png"
+
+# File sesi Playwright tidak menyimpan email pemiliknya, dan is_logged_in()
+# hanya bisa menjawab "ada yang login" - bukan "akun yang mana". Tanpa catatan
+# ini, sesi akun sebelumnya yang tertinggal akan dipakai ulang dan laporan
+# terkirim atas nama akun yang salah tanpa peringatan apa pun.
+SESSION_OWNER_PATH = STORAGE_STATE_PATH + ".owner"
 
 # CATATAN BAHASA: UI TikTok bisa muncul dalam Bahasa Indonesia atau Inggris,
 # tidak konsisten walau locale di-set "id-ID". Karena itu selector selalu
@@ -384,14 +391,58 @@ async def is_logged_in(page: Page) -> bool:
         return False
 
 
+def session_owner() -> str:
+    """Email akun pemilik file sesi tersimpan; "" kalau tidak tercatat."""
+    try:
+        with open(SESSION_OWNER_PATH, encoding="utf-8") as handle:
+            return str(json.load(handle).get("email", "")).strip()
+    except Exception:
+        return ""
+
+
+def save_session_owner(email: str) -> None:
+    """Catat akun pemilik sesi, dipanggil tiap kali storage_state disimpan."""
+    try:
+        with open(SESSION_OWNER_PATH, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"email": (email or "").strip(), "saved_at": time.time()},
+                handle,
+            )
+    except Exception as e:
+        print(f"[SESI] Gagal mencatat pemilik sesi: {e}")
+
+
+def session_belongs_to(email: str) -> bool:
+    """True hanya kalau sesi tersimpan memang milik `email`.
+
+    Pemilik yang tidak tercatat dianggap BUKAN milik akun ini: lebih baik
+    login ulang daripada melaporkan video atas nama akun yang salah.
+    """
+    email = (email or "").strip().lower()
+    owner = session_owner().strip().lower()
+    return bool(email and owner and owner == email)
+
+
 def clear_session_file(reason: str = "") -> bool:
     """Hapus file sesi tersimpan supaya run berikutnya login dari nol.
 
-    Hanya untuk dua hal: setelah logout disengaja, dan saat sesi terdeteksi
-    rusak. Sesi yang sehat justru yang membuat OTP dan captcha jarang muncul.
+    Dipakai setelah logout disengaja, saat sesi terdeteksi rusak, dan saat
+    sesi ternyata milik akun lain. Sesi yang sehat justru yang membuat OTP dan
+    captcha jarang muncul, jadi jangan dihapus tanpa alasan.
     """
+    # Catatan pemilik selalu ikut dibuang, termasuk kalau file sesinya sendiri
+    # sudah tidak ada - catatan yang tertinggal bisa membuat sesi akun lain
+    # dianggap milik akun ini di run berikutnya.
+    owner_removed = False
+    if os.path.exists(SESSION_OWNER_PATH):
+        try:
+            os.remove(SESSION_OWNER_PATH)
+            owner_removed = True
+        except Exception as e:
+            print(f"[SESI] Gagal menghapus {SESSION_OWNER_PATH}: {e}")
+
     if not os.path.exists(STORAGE_STATE_PATH):
-        return False
+        return owner_removed
     try:
         os.remove(STORAGE_STATE_PATH)
         suffix = f" ({reason})" if reason else ""

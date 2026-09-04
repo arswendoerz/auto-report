@@ -15,7 +15,7 @@ from tkinter import filedialog, messagebox, ttk
 import config
 import main as report_main
 import win_embed
-from tiktok_login import clear_session_file
+from tiktok_login import clear_session_file, session_belongs_to, session_owner
 
 ENV_PATH = ".env"
 # Jeda sebelum report berjalan otomatis setelah akun berganti. Memberi waktu
@@ -157,7 +157,6 @@ class ReportApp:
         self.saved_accounts = []
         self.saved_accounts_path = None
         self.active_account_index = None
-        self.session_needs_reset = False
         self._rotate_timer = None
         self._last_ran_account_index = None
         self.email_account_value = ""
@@ -508,7 +507,6 @@ class ReportApp:
         source, accounts, error = load_saved_accounts(path)
         self.saved_accounts = accounts
         self.active_account_index = None
-        self.session_needs_reset = bool(os.path.exists(config.STORAGE_STATE_PATH))
         self.active_account_var.set("Belum ada akun dimuat.")
         self.next_account_button.configure(state="disabled")
         self.account_file_var.set(source or "Belum ada file dipilih.")
@@ -588,7 +586,6 @@ class ReportApp:
 
         if os.path.exists(config.STORAGE_STATE_PATH):
             clear_session_file("berpindah ke akun berikutnya")
-        self.session_needs_reset = False
         self._set_active_account(next_index)
         self._log_line(f"[GUI] Beralih ke akun {next_index + 1} dari {len(self.saved_accounts)}.")
         return True
@@ -824,15 +821,6 @@ class ReportApp:
         app_password = self.app_password_var.get().strip()
         inbox = email
 
-        if self.active_account_index is not None and self.session_needs_reset:
-            if not os.path.exists(config.STORAGE_STATE_PATH):
-                self.session_needs_reset = False
-            else:
-                # Hapus sesi otomatis saat rotasi akun
-                self._log_line("[GUI] Sesi akun sebelumnya dihapus otomatis untuk rotasi akun.")
-                clear_session_file("rotasi akun otomatis")
-                self.session_needs_reset = False
-
         if not raw_video.strip():
             return None, "Kode/link video belum diisi."
         url = report_main.normalize_tiktok_url(raw_video)
@@ -847,6 +835,15 @@ class ReportApp:
         if not app_password:
             return None, ("App Password Gmail belum diisi. Ini bukan password "
                           "akun biasa - buat di myaccount.google.com/apppasswords.")
+
+        # Sesi milik akun lain harus dibuang SEBELUM browser dijalankan.
+        # Pemeriksaannya berbasis email, bukan cuma "apakah tadi rotasi akun",
+        # supaya input manual dan restart aplikasi ikut terlindungi.
+        if os.path.exists(config.STORAGE_STATE_PATH) and not session_belongs_to(email):
+            owner = session_owner()
+            milik = owner if owner else "akun yang tidak tercatat"
+            self._log_line(f"[SESI] Sesi tersimpan milik {milik}, bukan {email}.")
+            clear_session_file("sesi milik akun lain")
 
         config.apply_credentials(
             tiktok_email=email,
@@ -1175,11 +1172,9 @@ class ReportApp:
         if self.worker and self.worker.is_alive():
             return
         if not os.path.exists(config.STORAGE_STATE_PATH):
-            self.session_needs_reset = False
             self._log_line("[SESI] Tidak ada file sesi tersimpan.")
             return
-        if clear_session_file("dihapus dari GUI"):
-            self.session_needs_reset = False
+        clear_session_file("dihapus dari GUI")
 
     def _drain_ui_queue(self):
         # Dibatasi per siklus supaya banjir log tidak membekukan jendela.

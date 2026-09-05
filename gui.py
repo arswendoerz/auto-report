@@ -436,6 +436,15 @@ class ReportApp:
         )
         self.auto_rotate_check.grid(row=5, column=0, sticky="w", pady=(2, 3))
 
+        # Tanpa opsi ini, satu akun yang kena captcha/rate-limit menahan
+        # seluruh antrean sampai ada orang yang menjawab prompt manual.
+        self.skip_manual_var = tk.BooleanVar(value=True)
+        self.skip_manual_check = ttk.Checkbutton(
+            card, text="Batalkan akun yang butuh input manual (captcha/OTP)",
+            variable=self.skip_manual_var, style="TCheckbutton",
+        )
+        self.skip_manual_check.grid(row=6, column=0, sticky="w", pady=(0, 3))
+
         self.account_source_var = tk.StringVar(
             value="Pilih file dulu; kredensial tidak dibaca otomatis saat aplikasi dibuka."
         )
@@ -443,7 +452,7 @@ class ReportApp:
             card, textvariable=self.account_source_var, style="Muted.TLabel",
             wraplength=380, justify="left",
         )
-        source_label.grid(row=6, column=0, sticky="w", pady=(0, 5))
+        source_label.grid(row=7, column=0, sticky="w", pady=(0, 5))
         self._wrap_with_parent(source_label, slack=28)
 
         self.manual_fields_visible = False
@@ -844,6 +853,10 @@ class ReportApp:
             milik = owner if owner else "akun yang tidak tercatat"
             self._log_line(f"[SESI] Sesi tersimpan milik {milik}, bukan {email}.")
             clear_session_file("sesi milik akun lain")
+
+        # Mode tanpa pengawasan ikut kondisi centang, dibaca ulang tiap run
+        # supaya perubahan di tengah batch langsung berlaku.
+        config.set_unattended(self.skip_manual_var.get())
 
         config.apply_credentials(
             tiktok_email=email,

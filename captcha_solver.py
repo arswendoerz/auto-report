@@ -9,6 +9,8 @@ import numpy as np
 from playwright.async_api import Page
 import os
 
+import config
+
 async def solve_slider_captcha(page: Page) -> bool:
     """
     Mencoba menyelesaikan captcha geser TikTok secara otomatis.
@@ -137,7 +139,8 @@ async def check_and_solve_captcha(page: Page) -> bool:
         success = await solve_slider_captcha(page)
         if not success:
             print("[CAPTCHA] Gagal otomatis. Silakan selesaikan secara manual.")
-            input("Selesaikan captcha manual, lalu tekan Enter...")
+            if config.manual_input("Selesaikan captcha manual, lalu tekan Enter...") is None:
+                return False
             await page.wait_for_selector(captcha_selector, state="detached", timeout=30000)
             print("[CAPTCHA] Captcha selesai manual.")
         return True

@@ -54,6 +54,14 @@ LOGIN_ERROR_SELECTORS = [
     "text=/[Cc]ouldn'?t find (your )?account/i",
     "text=/Terlalu banyak percobaan/i",
     "text=/[Tt]oo many attempts/i",
+    # Pembatasan laju TikTok. Ini muncul sebagai galat merah di form login,
+    # bukan captcha. Tanpa pola di bawah, alurnya jatuh ke cabang "verifikasi
+    # manual" dan menunggu manusia - padahal akun ini memang tidak bisa
+    # dilanjutkan sekarang dan seharusnya langsung dilewati.
+    "text=/Frekuensi kunjungan terlalu sering/i",
+    "text=/[Vv]isiting too frequently/i",
+    "text=/Jumlah percobaan maksimum/i",
+    "text=/[Mm]aximum number of attempts/i",
 ]
 
 OTP_ERROR_SELECTORS = [
@@ -228,7 +236,8 @@ async def _handle_otp_verification(page: Page) -> bool:
         print("[LOGIN] Halaman verifikasi terdeteksi.")
     else:
         print("[WARNING] Tidak ada halaman verifikasi terdeteksi otomatis.")
-        input("Periksa browser. Jika sudah login, tekan Enter untuk lanjut...")
+        if config.manual_input("Periksa browser. Jika sudah login, tekan Enter untuk lanjut...") is None:
+            return False
         return await _wait_for_logged_in(page)
 
     # GARIS BATAS - harus dicatat SEBELUM kode diminta. Tanpa ini, polling
@@ -251,7 +260,8 @@ async def _handle_otp_verification(page: Page) -> bool:
         print("[LOGIN] Opsi kirim OTP ke email diklik.")
     else:
         print("[WARNING] Gagal klik otomatis. Klik manual.")
-        input("Klik 'Alamat email'/'Email' manual, lalu Enter...")
+        if config.manual_input("Klik 'Alamat email'/'Email' manual, lalu Enter...") is None:
+            return False
 
     # Indeks 0-1 = halaman OTP muncul, >=2 = ternyata sudah langsung login.
     outcome = await first_match(
@@ -270,7 +280,8 @@ async def _handle_otp_verification(page: Page) -> bool:
     otp_input = await _find_otp_input(page)
     if otp_input is None:
         print("[ERROR] Field OTP tidak ditemukan. Isi manual.")
-        input("Isi OTP manual di browser, lalu tekan Enter...")
+        if config.manual_input("Isi OTP manual di browser, lalu tekan Enter...") is None:
+            return False
         return await _wait_for_logged_in(page)
 
     print("\n[OTP] Menunggu OTP terbaru...")
@@ -279,10 +290,14 @@ async def _handle_otp_verification(page: Page) -> bool:
     otp_code = await asyncio.to_thread(wait_for_new_otp, after_uid=baseline_uid)
 
     if not otp_code:
-        otp_code = input("Gagal ambil OTP otomatis. Ketik OTP 6 digit manual: ").strip()
+        manual = config.manual_input("Gagal ambil OTP otomatis. Ketik OTP 6 digit manual: ")
+        if manual is None:
+            return False
+        otp_code = manual.strip()
         if not otp_code or len(otp_code) != 6 or not otp_code.isdigit():
             print("[ERROR] OTP tidak valid. Selesaikan login manual di browser.")
-            input("Tekan Enter setelah login manual selesai...")
+            if config.manual_input("Tekan Enter setelah login manual selesai...") is None:
+                return False
             return await _wait_for_logged_in(page)
 
     try:
@@ -290,7 +305,8 @@ async def _handle_otp_verification(page: Page) -> bool:
         print(f"[LOGIN] OTP {otp_code} diisi.")
     except Exception as e:
         print(f"[ERROR] Gagal isi OTP: {e}")
-        input("Isi manual di browser, lalu Enter...")
+        if config.manual_input("Isi manual di browser, lalu Enter...") is None:
+            return False
 
     clicked = await click_first(
         page,
@@ -314,7 +330,8 @@ async def _handle_otp_verification(page: Page) -> bool:
         return True
 
     print("[WARNING] Selesaikan verifikasi manual di browser, lalu tekan Enter.")
-    input()
+    if config.manual_input() is None:
+        return False
     return await _wait_for_logged_in(page)
 
 
@@ -353,8 +370,9 @@ async def login_tiktok(page: Page) -> bool:
         print("[LOGIN] Login berhasil (tanpa verifikasi).")
         success = True
     elif outcome is not None and outcome >= n_ok + n_verify + len(CAPTCHA_SELECTORS):
-        print("[ERROR] Login ditolak (kredensial salah / terlalu banyak percobaan).")
-        print("[ERROR] Periksa TIKTOK_EMAIL & TIKTOK_PASSWORD di .env.")
+        print("[ERROR] Login ditolak TikTok (kredensial salah, terlalu banyak "
+              "percobaan, atau frekuensi kunjungan dibatasi).")
+        print("[ERROR] Akun ini dibatalkan; beri jeda sebelum dicoba lagi.")
         return False
     else:
         if outcome == n_ok + n_verify:

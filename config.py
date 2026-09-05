@@ -182,3 +182,28 @@ LOGOUT_AFTER_REPORT = _flag("LOGOUT_AFTER_REPORT", False)
 # Hapus file sesi otomatis HANYA saat terdeteksi rusak (halaman video
 # menampilkan "Log masuk"). Bukan hapus-sesi-tiap-run.
 AUTO_CLEAR_STALE_SESSION = _flag("AUTO_CLEAR_STALE_SESSION", True)
+
+# Mode tanpa pengawasan. Saat aktif, setiap permintaan bantuan manual di
+# tengah alur (captcha, OTP, verifikasi) TIDAK menunggu manusia: akun yang
+# bersangkutan dibatalkan supaya antrean akun berikutnya tetap jalan.
+UNATTENDED = _flag("UNATTENDED", False)
+
+
+def set_unattended(value: bool) -> None:
+    """Dipakai gui.py untuk menyalakan mode batch tanpa pengawasan."""
+    global UNATTENDED
+    UNATTENDED = bool(value)
+
+
+def manual_input(prompt: str = ""):
+    """Minta bantuan manual lewat input(). Return None kalau mode UNATTENDED.
+
+    Pemanggil WAJIB memperlakukan None sebagai "tidak ada manusia yang akan
+    menjawab" dan membatalkan langkahnya - bukan melanjutkan seolah-olah
+    langkah manualnya sudah dikerjakan.
+    """
+    if UNATTENDED:
+        pesan = prompt.strip() or "langkah manual"
+        print(f"[AUTO] Butuh input manual ({pesan}) - akun ini dibatalkan.")
+        return None
+    return input(prompt)

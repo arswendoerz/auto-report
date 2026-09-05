@@ -9,6 +9,7 @@ import sys
 
 from playwright.async_api import Page
 
+import config
 from config import FAST_TIMEOUT, SLOW_TIMEOUT
 from captcha_solver import check_and_solve_captcha
 from perf import (
@@ -36,6 +37,14 @@ REPORT_DONE_SELECTORS = [
     "text=/Laporan.*(terkirim|diterima)/i",
     "text=/[Rr]eport (submitted|received)/i",
 ]
+
+
+class ManualStepRequired(RuntimeError):
+    """Alur report butuh campur tangan manusia, tapi mode UNATTENDED aktif.
+
+    Dilempar supaya run ini dihitung gagal dan batch lanjut ke akun
+    berikutnya, bukan menggantung menunggu jawaban yang tidak akan datang.
+    """
 
 
 class StaleSessionError(RuntimeError):
@@ -155,7 +164,9 @@ async def _pick_reason(page: Page, label: str, pattern, fallback_index: int, pre
         print(f"[REPORT] '{label}' dipilih.")
     else:
         print(f"[INFO] Pilih '{label}' secara manual di jendela browser.")
-        input("Setelah dipilih, tekan Enter untuk lanjut...")
+        if config.manual_input("Setelah dipilih, tekan Enter untuk lanjut...") is None:
+            # Tanpa opsi ini terpilih, sisa alur report tidak ada artinya.
+            raise ManualStepRequired(f"opsi '{label}' tidak bisa dipilih otomatis")
 
     await wait_panel_change(page, REASON_LABEL_SELECTOR, previous_signature, timeout=FAST_TIMEOUT + 2000)
     return clicked, await panel_signature(page, REASON_LABEL_SELECTOR)
